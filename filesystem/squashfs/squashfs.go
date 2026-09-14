@@ -739,7 +739,7 @@ func (fs *FileSystem) readBlock(location int64, compressed bool, size uint32) ([
 		return nil, fmt.Errorf("read %d bytes instead of expected %d", read, size)
 	}
 	if compressed {
-		b, err = fs.compressor.decompress(b)
+		b, err = fs.compressor.decompress(b, int(fs.superblock.blocksize))
 		if err != nil {
 			return nil, fmt.Errorf("decompress error: %v", err)
 		}
@@ -773,7 +773,7 @@ func (fs *FileSystem) readFragment(index, offset uint32, fragmentSize int64) ([]
 			if fs.compressor == nil {
 				return nil, 0, fmt.Errorf("fragment compressed but do not have valid compressor")
 			}
-			data, err = fs.compressor.decompress(b)
+			data, err = fs.compressor.decompress(b, int(fs.superblock.blocksize))
 			if err != nil {
 				return nil, 0, fmt.Errorf("decompress error: %v", err)
 			}

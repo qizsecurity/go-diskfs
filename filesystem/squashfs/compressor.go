@@ -17,7 +17,12 @@ import (
 // Compressor defines a compressor. Fulfilled by various implementations in this package
 type Compressor interface {
 	compress([]byte) ([]byte, error)
-	decompress([]byte) ([]byte, error)
+	// decompress decodes a compressed block. maxOut is the caller's known
+	// upper bound on the decompressed size (SquashFS metadata blocks are
+	// always <= standardMetadataBlocksize; data/fragment blocks are always
+	// <= the filesystem's blocksize) -- every compressor except
+	// CompressorLz4 ignores it; their behaviour is unchanged.
+	decompress(in []byte, maxOut int) ([]byte, error)
 	loadOptions([]byte) error
 	optionsBytes() []byte
 	flavour() compression
@@ -41,7 +46,8 @@ func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorLzma) decompress(in []byte) ([]byte, error) {
+func (c *CompressorLzma) decompress(in []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	lz, err := lzma.NewReader(b)
 	if err != nil {
@@ -101,7 +107,8 @@ func (c *CompressorGzip) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorGzip) decompress(in []byte) ([]byte, error) {
+func (c *CompressorGzip) decompress(in []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	gz, err := zlib.NewReader(b)
 	if err != nil {
@@ -187,7 +194,8 @@ func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorXz) decompress(in []byte) ([]byte, error) {
+func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	xzReader, err := xz.NewReader(b)
 	if err != nil {
@@ -258,14 +266,41 @@ func (c *CompressorLz4) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorLz4) decompress(in []byte) ([]byte, error) {
-	b := bytes.NewReader(in)
-	lz := lz4.NewReader(b)
-	p, err := io.ReadAll(lz)
+
+// decompress decodes a raw LZ4 BLOCK (liblz4's block API), which is what
+// SquashFS 4.0 actually stores for compression id 5 -- NOT the LZ4 FRAME
+// format (magic number + frame header) this function used to assume.
+//
+// Confirmed against both producers of on-disk SquashFS lz4 data:
+//   - Linux kernel, fs/squashfs/lz4_wrapper.c, lz4_uncompress(): calls
+//     LZ4_decompress_safe(stream->input, stream->output, length,
+//     output->length) directly on the block bytes read off disk -- no frame
+//     magic, no frame header, ever.
+//   - squashfs-tools, squashfs-tools/lz4_wrapper.c, lz4_compress(): calls
+//     COMPRESS()/COMPRESS_HC() macros, which squashfs-tools/lz4_wrapper.h
+//     (for the lz4 library used by this build) defines as
+//     LZ4_compress_fast()/LZ4_compress_HC() -- both the pierrec/lz4/v4
+//     library's block API's own C equivalents, and the SAME raw-block
+//     encoding for plain -comp lz4 AND -comp lz4 -Xhc: HC only changes how
+//     the encoder searches for matches, not the decoder-visible framing.
+//
+// maxOut is the caller's own upper bound on the decompressed size (a
+// SquashFS invariant, not a guess): metadata blocks decompress to at most
+// standardMetadataBlocksize (8192) bytes; data and fragment blocks decompress
+// to at most the filesystem's own superblock blocksize. lz4's raw block
+// format carries no embedded output-length header -- unlike the frame
+// format's streaming io.ReadAll, decoding it requires a pre-sized
+// destination up front.
+func (c *CompressorLz4) decompress(in []byte, maxOut int) ([]byte, error) {
+	if maxOut <= 0 {
+		return nil, fmt.Errorf("error decompressing: maxOut must be > 0 for raw LZ4 block decode, got %d", maxOut)
+	}
+	dst := make([]byte, maxOut)
+	n, err := lz4.UncompressBlock(in, dst)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing: %v", err)
 	}
-	return p, nil
+	return dst[:n], nil
 }
 func (c *CompressorLz4) loadOptions(b []byte) error {
 	expected := 8
@@ -347,7 +382,8 @@ func (c *CompressorZstd) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorZstd) decompress(in []byte) ([]byte, error) {
+func (c *CompressorZstd) decompress(in []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	z, err := zstd.NewReader(nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd decompressor: %w", err)
@@ -366,7 +402,8 @@ type CompressorLzo struct {
 func (c *CompressorLzo) compress(_ []byte) ([]byte, error) {
 	return nil, fmt.Errorf("LZO compression not yet supported")
 }
-func (c *CompressorLzo) decompress(in []byte) ([]byte, error) {
+func (c *CompressorLzo) decompress(in []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	lz := lzo.NewReader(b)
 	p, err := io.ReadAll(lz)

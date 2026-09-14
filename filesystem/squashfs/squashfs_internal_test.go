@@ -276,6 +276,11 @@ func TestReadBlock(t *testing.T) {
 		fs := &FileSystem{
 			backend:    file.New(testFile, true),
 			compressor: tt.compressor,
+			// readBlock now passes fs.superblock.blocksize as decompress's
+			// maxOut (needed for CompressorLz4's raw-block decode, which
+			// carries no embedded output-length header); a real FileSystem
+			// always has a superblock by the time readBlock runs.
+			superblock: &superblock{blocksize: testValidBlocksize},
 		}
 		b, err := fs.readBlock(tt.location, tt.compressed, size)
 		switch {
@@ -333,6 +338,9 @@ func TestReadFragment(t *testing.T) {
 			fragments:  fragments,
 			backend:    file.New(testFile, true),
 			compressor: tt.compressor,
+			// readFragment now passes fs.superblock.blocksize as decompress's
+			// maxOut -- see the matching comment in TestReadBlock.
+			superblock: &superblock{blocksize: testValidBlocksize},
 		}
 		b, err := fs.readFragment(tt.index, tt.offset, tt.size)
 		switch {

@@ -12,7 +12,8 @@ func (c *testCompressorAddBytes) compress(b []byte) ([]byte, error) {
 	}
 	return b[:len(b)-len(c.b)], nil
 }
-func (c *testCompressorAddBytes) decompress(b []byte) ([]byte, error) {
+func (c *testCompressorAddBytes) decompress(b []byte, maxOut int) ([]byte, error) {
+	_ = maxOut // this mock ignores it, like every real compressor except CompressorLz4
 	if c.err != nil {
 		return nil, c.err
 	}

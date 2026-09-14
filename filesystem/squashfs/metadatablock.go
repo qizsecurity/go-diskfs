@@ -40,7 +40,7 @@ func parseMetadata(b []byte, c Compressor) (block *metadatablock, err error) {
 	}
 	data := b[2 : 2+size]
 	if compressed {
-		data, err = c.decompress(data)
+		data, err = c.decompress(data, standardMetadataBlocksize)
 		if err != nil {
 			return nil, fmt.Errorf("decompress error: %v", err)
 		}
@@ -94,7 +94,7 @@ func (fs *FileSystem) readMetaBlock(r io.ReaderAt, c Compressor, location int64)
 			if c == nil {
 				return nil, 0, fmt.Errorf("metadata block at %d compressed, but no compressor provided", location)
 			}
-			data, err = c.decompress(b)
+			data, err = c.decompress(b, standardMetadataBlocksize)
 			if err != nil {
 				return nil, 0, fmt.Errorf("decompress error: %v", err)
 			}
