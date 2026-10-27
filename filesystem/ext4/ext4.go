@@ -20,6 +20,10 @@ import (
 	"github.com/google/uuid"
 )
 
+// ErrInlineData is returned for an inode whose data is stored inside the inode (the inline_data feature,
+// EXT4_INLINE_DATA_FL). Inline data is not read by this package.
+var ErrInlineData = errors.New("inline data not supported")
+
 // SectorSize indicates what the sector size in bytes is
 type SectorSize uint16
 
@@ -1194,7 +1198,7 @@ func (fs *FileSystem) ReadDir(p string) ([]iofs.DirEntry, error) {
 	}
 	dir, err := fs.readDirWithMkdir(p, false)
 	if err != nil {
-		return nil, fmt.Errorf("error reading directory %s: %v", p, err)
+		return nil, fmt.Errorf("error reading directory %s: %w", p, err)
 	}
 	// once we have made it here, looping is done. We have found the final entry
 	// we need to return all of the file info
@@ -1280,6 +1284,9 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		}
 		return fs.OpenFile(linkTarget, flag)
 	}
+	if inode.flags.inlineData {
+		return nil, fmt.Errorf("cannot open %s (inode %d): %w", p, inodeNumber, ErrInlineData)
+	}
 	if inode.extents == nil {
 		return nil, fmt.Errorf("cannot open special file %s (inode %d): no extent tree", p, inodeNumber)
 	}
@@ -1316,6 +1323,9 @@ func (fs *FileSystem) openFileViaInode(inodeNumber uint32, flag int) (filesystem
 	// if a symlink, read the target, rather than the inode itself, which does not point to anything
 	if inode.fileType == fileTypeSymbolicLink {
 		return nil, fmt.Errorf("cannot open file via inode: inode %d is a symbolic link", inodeNumber)
+	}
+	if inode.flags.inlineData {
+		return nil, fmt.Errorf("cannot open inode %d: %w", inodeNumber, ErrInlineData)
 	}
 	if inode.extents == nil {
 		return nil, fmt.Errorf("cannot open special file (inode %d): no extent tree", inodeNumber)
@@ -1586,7 +1596,7 @@ func (fs *FileSystem) getEntryAndParent(p string) (parent *Directory, entry *dir
 	// get the directory entries
 	parentDir, err := fs.readDirWithMkdir(dir, false)
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not read directory entries for %s", dir)
+		return nil, nil, fmt.Errorf("could not read directory entries for %s: %w", dir, err)
 	}
 	// we now know that the directory exists, see if the file exists
 	var targetEntry *directoryEntry
@@ -1651,6 +1661,10 @@ func (fs *FileSystem) readInode(inodeNumber uint32) (*inode, error) {
 	}
 	// fill in symlink target if needed
 	if inode.fileType == fileTypeSymbolicLink && inode.linkTarget == "" {
+		// a symlink with inline data has no extent tree
+		if inode.flags.inlineData {
+			return nil, fmt.Errorf("symlink inode %d: %w", inodeNumber, ErrInlineData)
+		}
 		// read the symlink target
 		extents, err := inode.extents.blocks(fs)
 		if err != nil {
@@ -1707,6 +1721,10 @@ func (fs *FileSystem) readDirectory(inodeNumber uint32) ([]*directoryEntry, erro
 	in, err := fs.readInode(inodeNumber)
 	if err != nil {
 		return nil, fmt.Errorf("could not read inode %d for directory: %v", inodeNumber, err)
+	}
+	// an inline-data directory has no extent tree: its entries are in i_block and the system.data attribute
+	if in.flags.inlineData {
+		return nil, fmt.Errorf("directory inode %d: %w", in.number, ErrInlineData)
 	}
 	// convert the extent tree into a sorted list of extents
 	extents, err := in.extents.blocks(fs)
@@ -1807,7 +1825,7 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, error
 	}
 	entries, err := fs.readDirectory(rootInode)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read directory %s: %v", "/", err)
+		return nil, fmt.Errorf("failed to read directory %s: %w", "/", err)
 	}
 	currentDir.entries = entries
 	for i, subp := range paths {
@@ -1848,7 +1866,7 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, error
 		// get all of the entries in this directory
 		entries, err = fs.readDirectory(currentDir.inode)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read directory %s", "/"+strings.Join(paths[0:i+1], "/"))
+			return nil, fmt.Errorf("failed to read directory %s: %w", "/"+strings.Join(paths[0:i+1], "/"), err)
 		}
 		currentDir.entries = entries
 	}

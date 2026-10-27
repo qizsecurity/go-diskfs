@@ -163,13 +163,24 @@ func qizReadChunks(fsys *FileSystem, p string, size int64, chunk int) ([]byte, e
 	}
 }
 
-// qizCompareRow compares one oracle row with what the reader reports. It returns the names
-// of the fields that differ, each with both values. Nothing is returned when all equal.
-func qizCompareRow(fsys *FileSystem, r qizOracleRow) []string {
-	var diffs []string
+// qizDiff is one difference between an oracle row and what the reader reports: a field whose
+// value differs, or an operation that returned an error (err is then that error).
+type qizDiff struct {
+	field string
+	text  string
+	err   error
+}
+
+func (d qizDiff) String() string { return d.field + ": " + d.text }
+
+// qizCompareRow compares one oracle row with what the reader reports. It returns the fields
+// that differ, each with both values, and the operations that failed. Nothing is returned
+// when all equal.
+func qizCompareRow(fsys *FileSystem, r qizOracleRow) []qizDiff {
+	var diffs []qizDiff
 	st, err := fsys.Stat(r.path)
 	if err != nil {
-		return []string{"stat: " + err.Error()}
+		return []qizDiff{{"stat", err.Error(), err}}
 	}
 	mode := st.Mode()
 	typ := "f"
@@ -210,7 +221,7 @@ func qizCompareRow(fsys *FileSystem, r qizOracleRow) []string {
 	if typ == "l" {
 		l, err := fsys.ReadLink(r.path)
 		if err != nil {
-			diffs = append(diffs, "readlink: "+err.Error())
+			diffs = append(diffs, qizDiff{"readlink", err.Error(), err})
 			skip["link"] = true
 		} else {
 			got.link = l
@@ -219,7 +230,7 @@ func qizCompareRow(fsys *FileSystem, r qizOracleRow) []string {
 	if typ == "f" {
 		b, err := qizRead(fsys, r.path, st.Size())
 		if err != nil {
-			diffs = append(diffs, "read: "+err.Error())
+			diffs = append(diffs, qizDiff{"read", err.Error(), err})
 			skip["sha256"] = true
 		} else {
 			sum := sha256.Sum256(b)
@@ -235,16 +246,16 @@ func qizCompareRow(fsys *FileSystem, r qizOracleRow) []string {
 		{"link", r.link, got.link},
 	} {
 		if c.want != c.got && !skip[c.name] {
-			diffs = append(diffs, fmt.Sprintf("%s: want %s got %s", c.name, c.want, c.got))
+			diffs = append(diffs, qizDiff{c.name, fmt.Sprintf("want %s got %s", c.want, c.got), nil})
 		}
 	}
 	return diffs
 }
 
 // qizCompareAll compares every oracle row and returns a map path -> differences.
-func qizCompareAll(t *testing.T, fsys *FileSystem, rows []qizOracleRow) map[string][]string {
+func qizCompareAll(t *testing.T, fsys *FileSystem, rows []qizOracleRow) map[string][]qizDiff {
 	t.Helper()
-	out := map[string][]string{}
+	out := map[string][]qizDiff{}
 	for _, r := range rows {
 		if d := qizCompareRow(fsys, r); len(d) > 0 {
 			out[r.path] = d
@@ -253,7 +264,7 @@ func qizCompareAll(t *testing.T, fsys *FileSystem, rows []qizOracleRow) map[stri
 	return out
 }
 
-func qizSortedKeys(m map[string][]string) []string {
+func qizSortedKeys(m map[string][]qizDiff) []string {
 	k := make([]string, 0, len(m))
 	for p := range m {
 		k = append(k, p)
