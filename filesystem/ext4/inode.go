@@ -386,11 +386,15 @@ func inodeFromBytes(b []byte, sb *superblock, number uint32) (*inode, error) {
 		blockPointers:          blockPointers,
 		linkTarget:             linkTarget,
 	}
-	checksum := binary.LittleEndian.Uint32(checksumBytes)
-	actualChecksum := inodeChecksum(b, sb.checksumSeed, number, i.nfsFileVersion)
+	// the inode checksum fields are only used, and so only checked, when metadata_csum is on
+	// (Linux fs/ext4/inode.c ext4_inode_csum_verify)
+	if sb.features.metadataChecksums {
+		checksum := binary.LittleEndian.Uint32(checksumBytes)
+		actualChecksum := inodeChecksum(b, sb.checksumSeed, number, i.nfsFileVersion)
 
-	if actualChecksum != checksum {
-		return nil, fmt.Errorf("checksum mismatch, on-disk %x vs calculated %x", checksum, actualChecksum)
+		if actualChecksum != checksum {
+			return nil, fmt.Errorf("checksum mismatch, on-disk %x vs calculated %x", checksum, actualChecksum)
+		}
 	}
 
 	return &i, nil

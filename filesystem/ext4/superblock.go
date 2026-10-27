@@ -389,7 +389,9 @@ func superblockFromBytes(b []byte) (*superblock, error) {
 	sb.logGroupsPerFlex = uint64(math.Exp2(float64(b[0x174])))
 
 	sb.checksumType = b[0x175] // only valid one is 1
-	if sb.checksumType != checkSumTypeCRC32c {
+	// s_checksum_type is only used, and so only checked, when metadata_csum is on
+	// (Linux fs/ext4/super.c ext4_verify_csum_type); without it the byte is 0.
+	if sb.features.metadataChecksums && sb.checksumType != checkSumTypeCRC32c {
 		return nil, fmt.Errorf("cannot read superblock: invalid checksum type %d, only valid is %d", sb.checksumType, checkSumTypeCRC32c)
 	}
 
