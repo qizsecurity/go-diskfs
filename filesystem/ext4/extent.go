@@ -11,6 +11,9 @@ const (
 	extentTreeEntryLength  int    = 12
 	extentHeaderSignature  uint16 = 0xf30a
 	extentTreeMaxDepth     int    = 5
+	// extentInitMaxLen is EXT_INIT_MAX_LEN of the Linux kernel (fs/ext4/ext4_extents.h): the largest ee_len of a
+	// written extent. An ee_len above it is an unwritten extent of ee_len - extentInitMaxLen blocks.
+	extentInitMaxLen uint16 = 1 << 15
 )
 
 // extens a structure holding multiple extents
@@ -24,6 +27,9 @@ type extent struct {
 	startingBlock uint64
 	// count how many contiguous blocks are covered by this extent
 	count uint16
+	// unwritten the blocks are allocated but never written; they read as zeros, whatever is on the disk there.
+	// On disk this is ee_len > extentInitMaxLen, and ee_len - extentInitMaxLen is the length (count).
+	unwritten bool
 }
 
 // equal if 2 extents are equal
@@ -160,7 +166,11 @@ func (e extentLeafNode) toBytes() []byte {
 	for i, ext := range e.extents {
 		base := (i + 1) * 12
 		binary.LittleEndian.PutUint32(b[base:base+4], ext.fileBlock)
-		binary.LittleEndian.PutUint16(b[base+4:base+6], ext.count)
+		eeLen := ext.count
+		if ext.unwritten {
+			eeLen += extentInitMaxLen
+		}
+		binary.LittleEndian.PutUint16(b[base+4:base+6], eeLen)
 		diskBlock := make([]byte, 8)
 		binary.LittleEndian.PutUint64(diskBlock, ext.startingBlock)
 		copy(b[base+6:base+8], diskBlock[4:6])
@@ -336,9 +346,16 @@ func parseExtents(b []byte, blocksize, start, count uint32) (extentBlockFinder, 
 			diskBlock := make([]byte, 8)
 			copy(diskBlock[0:4], b[start+8:start+12])
 			copy(diskBlock[4:6], b[start+6:start+8])
+			// ee_len: above extentInitMaxLen the extent is unwritten and the length is ee_len - extentInitMaxLen
+			eeLen := binary.LittleEndian.Uint16(b[start+4 : start+6])
+			unwritten := eeLen > extentInitMaxLen
+			if unwritten {
+				eeLen -= extentInitMaxLen
+			}
 			leafNode.extents = append(leafNode.extents, extent{
 				fileBlock:     binary.LittleEndian.Uint32(b[start : start+4]),
-				count:         binary.LittleEndian.Uint16(b[start+4 : start+6]),
+				count:         eeLen,
+				unwritten:     unwritten,
 				startingBlock: binary.LittleEndian.Uint64(diskBlock),
 			})
 		}

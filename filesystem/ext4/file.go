@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 
 	"github.com/diskfs/go-diskfs/filesystem"
 )
@@ -50,38 +51,55 @@ func (fl *File) Read(b []byte) (int, error) {
 	readBytes := int64(0)
 	b = b[:bytesToRead]
 
-	// the offset given for reading is relative to the file, so we need to calculate
-	// where these are in the extents relative to the file
-	readStartBlock := uint64(fl.offset) / blocksize
-	for _, e := range fl.extents {
-		// if the last block of the extent is before the first block we want to read, skip it
-		if uint64(e.fileBlock)+uint64(e.count) < readStartBlock {
+	// Walk the file position by position. At each position the file has either an extent that covers it, or a hole.
+	// A written extent is read from the disk. An unwritten extent and a hole read as zeros
+	// (kernel fs/ext4/extents.c ext4_ext_map_blocks, ext4_ext_handle_unwritten_extents).
+	// Every step advances fl.offset by at least one byte, so Read never returns 0 bytes with a nil error before EOF.
+	for readBytes < bytesToRead {
+		blk := uint64(fl.offset) / blocksize
+		var (
+			covering  *extent
+			nextStart = uint64(math.MaxUint64) // first file block after blk that has an extent
+		)
+		for i := range fl.extents {
+			e := &fl.extents[i]
+			if uint64(e.fileBlock) <= blk && blk < uint64(e.fileBlock)+uint64(e.count) {
+				covering = e
+				break
+			}
+			if uint64(e.fileBlock) > blk && uint64(e.fileBlock) < nextStart {
+				nextStart = uint64(e.fileBlock)
+			}
+		}
+		// the bytes left to read in the extent or in the hole
+		var leftHere int64
+		if covering != nil {
+			leftHere = (int64(covering.fileBlock)+int64(covering.count))*int64(blocksize) - fl.offset
+		} else if nextStart != math.MaxUint64 {
+			leftHere = int64(nextStart*blocksize) - fl.offset
+		} else {
+			leftHere = bytesToRead - readBytes
+		}
+		toReadHere := min(bytesToRead-readBytes, leftHere)
+		dst := b[readBytes : readBytes+toReadHere]
+		if covering == nil || covering.unwritten {
+			clear(dst)
+			readBytes += toReadHere
+			fl.offset += toReadHere
 			continue
 		}
-		// extentSize is the number of bytes on the disk for the extent
-		extentSize := int64(e.count) * int64(blocksize)
-		// where do we start and end in the extent?
-		startPositionInExtent := fl.offset - int64(e.fileBlock)*int64(blocksize)
-		leftInExtent := extentSize - startPositionInExtent
-		// how many bytes are left to read
-		toReadInOffset := bytesToRead - readBytes
-		if toReadInOffset > leftInExtent {
-			toReadInOffset = leftInExtent
-		}
-		// read those bytes
-		startPosOnDisk := e.startingBlock*blocksize + uint64(startPositionInExtent)
-		b2 := make([]byte, toReadInOffset)
-		read, err := fl.filesystem.backend.ReadAt(b2, int64(startPosOnDisk))
+		// read those bytes from the disk
+		startPosOnDisk := covering.startingBlock*blocksize + uint64(fl.offset-int64(covering.fileBlock)*int64(blocksize))
+		read, err := fl.filesystem.backend.ReadAt(dst, int64(startPosOnDisk))
 		if err != nil {
 			return int(readBytes), fmt.Errorf("failed to read bytes: %v", err)
 		}
-		copy(b[readBytes:], b2[:read])
+		if read == 0 {
+			// ReadAt must return an error for a short read; do not loop if a backend does not
+			return int(readBytes), fmt.Errorf("failed to read bytes: %w", io.ErrUnexpectedEOF)
+		}
 		readBytes += int64(read)
 		fl.offset += int64(read)
-
-		if readBytes >= bytesToRead {
-			break
-		}
 	}
 	var err error
 	if fl.offset >= fileSize {
