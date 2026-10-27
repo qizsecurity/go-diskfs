@@ -24,6 +24,10 @@ import (
 // EXT4_INLINE_DATA_FL). Inline data is not read by this package.
 var ErrInlineData = errors.New("inline data not supported")
 
+// ErrNoExtentTree is returned for an inode that has no extent tree and no inline data, for example the
+// block-mapped directories and files of an ext2 or ext3 filesystem. Only extent trees are read by this package.
+var ErrNoExtentTree = errors.New("no extent tree")
+
 // SectorSize indicates what the sector size in bytes is
 type SectorSize uint16
 
@@ -1288,7 +1292,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		return nil, fmt.Errorf("cannot open %s (inode %d): %w", p, inodeNumber, ErrInlineData)
 	}
 	if inode.extents == nil {
-		return nil, fmt.Errorf("cannot open special file %s (inode %d): no extent tree", p, inodeNumber)
+		return nil, fmt.Errorf("cannot open special file %s (inode %d): %w", p, inodeNumber, ErrNoExtentTree)
 	}
 	offset := int64(0)
 	if flag&os.O_APPEND == os.O_APPEND {
@@ -1328,7 +1332,7 @@ func (fs *FileSystem) openFileViaInode(inodeNumber uint32, flag int) (filesystem
 		return nil, fmt.Errorf("cannot open inode %d: %w", inodeNumber, ErrInlineData)
 	}
 	if inode.extents == nil {
-		return nil, fmt.Errorf("cannot open special file (inode %d): no extent tree", inodeNumber)
+		return nil, fmt.Errorf("cannot open special file (inode %d): %w", inodeNumber, ErrNoExtentTree)
 	}
 	offset := int64(0)
 	if flag&os.O_APPEND == os.O_APPEND {
@@ -1665,6 +1669,9 @@ func (fs *FileSystem) readInode(inodeNumber uint32) (*inode, error) {
 		if inode.flags.inlineData {
 			return nil, fmt.Errorf("symlink inode %d: %w", inodeNumber, ErrInlineData)
 		}
+		if inode.extents == nil {
+			return nil, fmt.Errorf("symlink inode %d: %w", inodeNumber, ErrNoExtentTree)
+		}
 		// read the symlink target
 		extents, err := inode.extents.blocks(fs)
 		if err != nil {
@@ -1725,6 +1732,10 @@ func (fs *FileSystem) readDirectory(inodeNumber uint32) ([]*directoryEntry, erro
 	// an inline-data directory has no extent tree: its entries are in i_block and the system.data attribute
 	if in.flags.inlineData {
 		return nil, fmt.Errorf("directory inode %d: %w", in.number, ErrInlineData)
+	}
+	// a block-mapped directory (ext2, ext3) has no extent tree either
+	if in.extents == nil {
+		return nil, fmt.Errorf("directory inode %d: %w", in.number, ErrNoExtentTree)
 	}
 	// convert the extent tree into a sorted list of extents
 	extents, err := in.extents.blocks(fs)
