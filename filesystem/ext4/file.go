@@ -22,6 +22,8 @@ type File struct {
 	extents     extents
 	fileType    directoryFileType
 	filename    string
+	// inline is the whole content of a file whose data is inline (inode.flags.inlineData), read when it was opened
+	inline []byte
 }
 
 // Read reads up to len(b) bytes from the File.
@@ -45,6 +47,16 @@ func (fl *File) Read(b []byte) (int, error) {
 	bytesToRead := int64(len(b))
 	if fl.offset+bytesToRead > fileSize {
 		bytesToRead = fileSize - fl.offset
+	}
+
+	// a file with inline data is in memory
+	if fl.flags != nil && fl.flags.inlineData {
+		n := copy(b[:bytesToRead], fl.inline[fl.offset:])
+		fl.offset += int64(n)
+		if fl.offset >= fileSize {
+			return n, io.EOF
+		}
+		return n, nil
 	}
 
 	// Create a buffer to hold the bytes to be read

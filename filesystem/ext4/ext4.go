@@ -20,8 +20,9 @@ import (
 	"github.com/google/uuid"
 )
 
-// ErrInlineData is returned for an inode whose data is stored inside the inode (the inline_data feature,
-// EXT4_INLINE_DATA_FL). Inline data is not read by this package.
+// ErrInlineData is returned for a symbolic link whose target is stored as inline data (the inline_data
+// feature, EXT4_INLINE_DATA_FL) and is 60 bytes or longer. Inline files and directories are read (inline_data.go);
+// this case is not, because no real file system with such a link has been measured.
 var ErrInlineData = errors.New("inline data not supported")
 
 // ErrNoExtentTree is returned for an inode that has no extent tree and no inline data, for example the
@@ -1289,7 +1290,7 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		return fs.OpenFile(linkTarget, flag)
 	}
 	if inode.flags.inlineData {
-		return nil, fmt.Errorf("cannot open %s (inode %d): %w", p, inodeNumber, ErrInlineData)
+		return fs.openInlineFile(inode, flag, filename, entry.fileType)
 	}
 	if inode.extents == nil {
 		return nil, fmt.Errorf("cannot open special file %s (inode %d): %w", p, inodeNumber, ErrNoExtentTree)
@@ -1329,7 +1330,7 @@ func (fs *FileSystem) openFileViaInode(inodeNumber uint32, flag int) (filesystem
 		return nil, fmt.Errorf("cannot open file via inode: inode %d is a symbolic link", inodeNumber)
 	}
 	if inode.flags.inlineData {
-		return nil, fmt.Errorf("cannot open inode %d: %w", inodeNumber, ErrInlineData)
+		return fs.openInlineFile(inode, flag, "", directoryFileType(inode.fileType))
 	}
 	if inode.extents == nil {
 		return nil, fmt.Errorf("cannot open special file (inode %d): %w", inodeNumber, ErrNoExtentTree)
@@ -1731,7 +1732,7 @@ func (fs *FileSystem) readDirectory(inodeNumber uint32) ([]*directoryEntry, erro
 	}
 	// an inline-data directory has no extent tree: its entries are in i_block and the system.data attribute
 	if in.flags.inlineData {
-		return nil, fmt.Errorf("directory inode %d: %w", in.number, ErrInlineData)
+		return fs.readInlineDirectory(in.number)
 	}
 	// a block-mapped directory (ext2, ext3) has no extent tree either
 	if in.extents == nil {

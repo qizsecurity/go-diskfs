@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"testing"
 
 	"github.com/diskfs/go-diskfs/backend/file"
@@ -41,8 +40,8 @@ func qizWalk(fsys *FileSystem) (listed []string, refused map[string]error, panic
 
 // gpt-ext4 is made with inline_data (EXT4_INLINE_DATA_FL 0x10000000, Linux fs/ext4/ext4.h): the
 // inode has no extent tree, its data is in i_block and the system.data attribute. Reading such a
-// directory used to dereference the nil extent tree (panic in readDirectory). It must return
-// ErrInlineData; inline data is not read by this package.
+// directory used to dereference the nil extent tree (panic in readDirectory). Inline directories are
+// read now (inline_data.go): no directory is refused and nothing panics.
 func TestQizInlineDataDirectoryNoPanic(t *testing.T) {
 	fsys, err := qizReadFS(t, qizGPTExt4)
 	if err != nil {
@@ -55,41 +54,34 @@ func TestQizInlineDataDirectoryNoPanic(t *testing.T) {
 	if len(listed) == 0 {
 		t.Fatalf("walk listed nothing")
 	}
-	if len(refused) == 0 {
-		t.Fatalf("fixture check: expected inline directories in gpt-ext4, but every directory was read")
-	}
 	for dir, err := range refused {
-		if !errors.Is(err, ErrInlineData) {
-			t.Errorf("ReadDir(%q): got %v, want ErrInlineData", dir, err)
-		}
-	}
-	// the root directory has an extent tree and is listed
-	if _, bad := refused["."]; bad {
-		t.Errorf("the root directory was refused")
+		t.Errorf("ReadDir(%q): %v", dir, err)
 	}
 }
 
-// An inline file cannot be opened: ErrInlineData, not the "special file" message.
+// An inline file opens and reads: tiny.txt is 5 bytes, inode 21, flags 0x10000000 (measured).
 func TestQizInlineDataFileOpen(t *testing.T) {
 	fsys, err := qizReadFS(t, qizGPTExt4)
 	if err != nil {
 		t.Fatalf("open gpt-ext4: %v", err)
 	}
-	// tiny.txt: 5 bytes, inode 21, flags 0x10000000 (measured)
-	if _, err := fsys.OpenFile("tiny.txt", os.O_RDONLY); !errors.Is(err, ErrInlineData) {
-		t.Errorf("OpenFile(tiny.txt): got %v, want ErrInlineData", err)
+	data, err := qizRead(fsys, "tiny.txt", 5)
+	if err != nil {
+		t.Fatalf("read tiny.txt: %v", err)
+	}
+	if len(data) != 5 {
+		t.Errorf("tiny.txt: %d bytes, want 5", len(data))
 	}
 }
 
-// Every oracle row of gpt-ext4 either matches, or fails only with ErrInlineData (the row, or a
-// directory on its path, has inline data). No row differs for another reason.
+// Every oracle row of gpt-ext4 matches the kernel's row, inline directories and files included.
 func TestQizInlineDataOracleRows(t *testing.T) {
 	fsys, err := qizReadFS(t, qizGPTExt4)
 	if err != nil {
 		t.Fatalf("open gpt-ext4: %v", err)
 	}
 	rows := qizLoadOracle(t, qizGPTExt4)
-	var matched, inline []string
+	matched := 0
 	for _, r := range rows {
 		var diffs []qizDiff
 		func() {
@@ -100,26 +92,15 @@ func TestQizInlineDataOracleRows(t *testing.T) {
 			}()
 			diffs = qizCompareRow(fsys, r)
 		}()
-		switch {
-		case len(diffs) == 0:
-			matched = append(matched, r.path)
-		default:
-			onlyInline := true
-			for _, d := range diffs {
-				if d.err == nil || !errors.Is(d.err, ErrInlineData) {
-					onlyInline = false
-					t.Errorf("%s: %v", r.path, d)
-				}
-			}
-			if onlyInline {
-				inline = append(inline, r.path)
-			}
+		for _, d := range diffs {
+			t.Errorf("%s: %v", r.path, d)
+		}
+		if len(diffs) == 0 {
+			matched++
 		}
 	}
-	sort.Strings(matched)
-	sort.Strings(inline)
-	t.Logf("%d rows: %d match the oracle %v; %d refused with ErrInlineData %v", len(rows), len(matched), matched, len(inline), inline)
-	if len(matched) == 0 {
+	t.Logf("%d rows, %d match the oracle", len(rows), matched)
+	if matched == 0 {
 		t.Errorf("no row matched")
 	}
 }
