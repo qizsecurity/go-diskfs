@@ -10,6 +10,7 @@ import (
 	"github.com/anchore/go-lzo"
 	"github.com/klauspost/compress/zstd"
 	lz4 "github.com/pierrec/lz4/v4"
+	bcjxz "github.com/therootcompany/xz"
 	"github.com/ulikunitz/xz"
 	"github.com/ulikunitz/xz/lzma"
 )
@@ -196,8 +197,15 @@ func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 }
 func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
 	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
+	// Decode with github.com/therootcompany/xz, not ulikunitz/xz: mksquashfs
+	// -Xbcj <arch> (the "executable filter" of the xz compressor options)
+	// stores a block as an xz stream whose filter chain is BCJ + LZMA2, which
+	// ulikunitz/xz refuses ("xz: unsupported filter count"). therootcompany/xz
+	// is a port of the xz-embedded decoder and reads the BCJ x86, PowerPC,
+	// IA-64, ARM, ARM-Thumb and SPARC filters. A zero dictionary limit is that
+	// package's own default. compress is unchanged and still uses ulikunitz/xz.
 	b := bytes.NewReader(in)
-	xzReader, err := xz.NewReader(b)
+	xzReader, err := bcjxz.NewReader(b, 0)
 	if err != nil {
 		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
 	}
