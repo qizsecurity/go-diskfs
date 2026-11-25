@@ -732,6 +732,15 @@ func (sb *superblock) gdtChecksumType() gdtChecksumType {
 	return gdtChecksumTypeInFS
 }
 
+// groupDescriptorSeed returns the value groupDescriptorChecksum starts from, as the kernel does (fs/ext4/super.c,
+// ext4_group_desc_csum, v6.12): the crc32c seed for metadata_csum, crc16(~0, s_uuid) for gdt_csum.
+func (sb *superblock) groupDescriptorSeed() uint32 {
+	if sb.gdtChecksumType() == gdtChecksumGdt && sb.uuid != nil {
+		return uint32(crc.CRC16(0xffff, sb.uuid[:]))
+	}
+	return sb.checksumSeed
+}
+
 func (sb *superblock) blockGroupCount() uint64 {
 	whole := sb.blockCount / uint64(sb.blocksPerGroup)
 	part := sb.blockCount % uint64(sb.blocksPerGroup)

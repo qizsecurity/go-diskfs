@@ -321,13 +321,14 @@ func groupDescriptorChecksum(b []byte, hashSeed uint32, groupNumber uint16, chec
 		crcResult = crc.CRC32c(crcResult, b2)
 		checksum = uint16(crcResult & 0xffff)
 	case gdtChecksumGdt:
-		hashSeed16 := uint16(hashSeed & 0xffff)
-		crcResult := crc.CRC16(hashSeed16, numBytes)
-		b2 := make([]byte, len(b))
-		copy(b2, b)
-		b2[0x1e] = 0
-		b2[0x1f] = 0
-		checksum = crc.CRC16(crcResult, b)
+		// kernel ext4_group_desc_csum (fs/ext4/super.c, v6.12, lines 3223-3230): crc16 over the group number and the
+		// descriptor without its 2 checksum bytes, starting from the seed crc16(~0, s_uuid) that the caller passes
+		crcResult := crc.CRC16(uint16(hashSeed), numBytes)
+		crcResult = crc.CRC16(crcResult, b[:0x1e])
+		if len(b) > 0x20 {
+			crcResult = crc.CRC16(crcResult, b[0x20:])
+		}
+		checksum = crcResult
 	}
 	return checksum
 }
