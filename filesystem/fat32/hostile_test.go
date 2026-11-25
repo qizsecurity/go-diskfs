@@ -535,3 +535,183 @@ func TestHostileHeldBytesIsTheValidEntries(t *testing.T) {
 		t.Errorf("HeldBytes = %d, want %d (FAT is %d bytes)", got, want, spf*hostileSectors)
 	}
 }
+
+// hostileCrossLinked builds a volume with /BIG.BIN (4 MiB) and /D with n small files, then points every entry of D
+// at the first cluster and the size of BIG.BIN: n directory entries name one cluster chain.
+func hostileCrossLinked(t *testing.T, n int) []byte {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "xlink.img")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(hostileVolume); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fat32.Create(file.New(f, false), hostileVolume, 0, hostileSectors, "XLINK", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Mkdir("/D"); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]byte, 4<<20)
+	for i := range big {
+		big[i] = byte(i * 7)
+	}
+	w, err := fs.OpenFile("/BIG.BIN", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	for i := 0; i < n; i++ {
+		w, err := fs.OpenFile(fmt.Sprintf("/D/F%05d.TXT", i), os.O_CREATE|os.O_RDWR)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		_ = w.Close()
+	}
+	_ = f.Close()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	le := binary.LittleEndian
+	reserved, _ := hostileGeometry(b)
+	spc := uint32(b[0x0D])
+	_, spf := hostileGeometry(b)
+	data := (reserved + 2*spf) * hostileSectors
+	cl := func(c uint32) uint32 { return data + (c-2)*spc*hostileSectors }
+	bigOff, bigCluster := rawEntry(t, b, 2, "BIG     BIN")
+	bigSize := le.Uint32(b[bigOff+28:])
+	_, dc := rawEntry(t, b, 2, "D          ")
+	patched := 0
+	for c := dc; c >= 2 && c < 0x0FFFFFF8; c = le.Uint32(b[reserved*hostileSectors+4*c:]) & 0x0FFFFFFF {
+		for i := uint32(0); i < spc*hostileSectors; i += 32 {
+			o := cl(c) + i
+			if b[o] == 'F' && string(b[o+8:o+11]) == "TXT" && b[o+11]&0x18 == 0 {
+				setEntryCluster(b, o, bigCluster)
+				le.PutUint32(b[o+28:], bigSize)
+				patched++
+			}
+		}
+	}
+	if patched != n {
+		t.Fatalf("patched %d entries, want %d", patched, n)
+	}
+	return b
+}
+
+// countingWriter is the sink of the test: it counts the bytes written to it.
+type countingWriter struct{ n int64 }
+
+func (c *countingWriter) Write(p []byte) (int, error) { c.n += int64(len(p)); return len(p), nil }
+
+// walkFilesOnce lists D with ReadDirOnce and opens each file with OpenOnce, as a scanner does; it returns the number
+// of files whose bytes were written, the refusals (errors.Is ErrFileAlreadyEntered), the bytes written and the first
+// refusal's text.
+func walkFilesOnce(t *testing.T, fs *fat32.FileSystem) (written, refused int, bytes int64, firstRefusal string) {
+	t.Helper()
+	entries, err := fs.ReadDirOnce("D")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &countingWriter{}
+	for _, e := range entries {
+		f, err := fs.OpenOnce(path.Join("D", e.Name()))
+		if errors.Is(err, fat12.ErrFileAlreadyEntered) {
+			if refused == 0 {
+				firstRefusal = err.Error()
+			}
+			refused++
+			continue
+		}
+		if err != nil {
+			t.Fatalf("OpenOnce(%s): %v", e.Name(), err)
+		}
+		if _, err := io.Copy(sink, f); err != nil {
+			t.Fatal(err)
+		}
+		_ = f.Close()
+		written++
+	}
+	return written, refused, sink.n, firstRefusal
+}
+
+// 1,024 entries name one 4 MiB cluster chain. The chain is written once; the other 1,023 entries are refused, each
+// with the path and the first cluster. (Open on each: 21.6 s and 4 GiB through the sink, measured by the review of
+// QIZ-6665.) The FAT32 specification gives each cluster to one chain, so the second entry is a cross-link.
+func TestHostileCrossLinkedFilesAreWrittenOnce(t *testing.T) {
+	defer watchHeap(t)()
+	const n = 1024
+	b := hostileCrossLinked(t, n)
+	fs, err := hostileOpen(t, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, bigCluster := rawEntry(t, b, 2, "BIG     BIN")
+	var written, refused int
+	var bytes int64
+	var first string
+	alloc, took := allocDuring(func() { written, refused, bytes, first = walkFilesOnce(t, fs) })
+	t.Logf("files written %d, refused %d, bytes through the sink %d, first refusal: %s", written, refused, bytes, first)
+	if written != 1 || refused != n-1 || bytes != 4<<20 {
+		t.Errorf("written %d refused %d bytes %d, want 1, %d, %d", written, refused, bytes, n-1, 4<<20)
+	}
+	if !strings.Contains(first, "D/F") || !strings.Contains(first, fmt.Sprintf("first cluster %d", bigCluster)) {
+		t.Errorf("refusal %q does not name the path and the first cluster %d", first, bigCluster)
+	}
+	// The bound is on the chain, not on the directory: every Open reads directory D again (1,024 entries), which alone
+	// costs about 0.9 s and 1.9 GiB of allocation for 1,024 opens, with no data read (measured at e774f13, load 19);
+	// that cost is the same for distinct files and is not the cross-link. The cross-link cost was 4 GiB through the
+	// sink and 9 to 13 s more; the bytes above are the exact check, the time a coarse one.
+	t.Logf("took %v, allocated %d KiB", took, alloc>>10)
+	if took > 5*time.Second {
+		t.Errorf("took %v, want under 5 s", took)
+	}
+}
+
+// The same file opened twice by OpenOnce is refused the second time; a volume of distinct files is not refused.
+func TestHostileOpenOnceDistinctFilesUnchanged(t *testing.T) {
+	fs, err := hostileOpen(t, hostileBase(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := fs.OpenOnce("a/b/one.txt")
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil || string(got) != "hello world, a file of the test\n" {
+		t.Fatalf("read %q err %v", got, err)
+	}
+	if _, err := fs.OpenOnce("a/b/one.txt"); !errors.Is(err, fat12.ErrFileAlreadyEntered) {
+		t.Fatalf("second open: got %v, want ErrFileAlreadyEntered", err)
+	}
+}
+
+// HeldBytes counts the sets ReadDirOnce and OpenOnce keep: one entry for each directory listed and each file opened.
+func TestHostileHeldBytesCountsEnteredSets(t *testing.T) {
+	fs, err := hostileOpen(t, hostileBase(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := fs.HeldBytes()
+	if _, err := fs.ReadDirOnce("a/b"); err != nil {
+		t.Fatal(err)
+	}
+	f, err := fs.OpenOnce("a/b/one.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if got, want := fs.HeldBytes()-before, int64(2*24); got != want {
+		t.Errorf("HeldBytes grew by %d, want %d (one directory, one file)", got, want)
+	}
+}
