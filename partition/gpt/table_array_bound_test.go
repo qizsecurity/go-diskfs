@@ -54,6 +54,10 @@ func writeBoundDisk(t *testing.T, edit func(primary, backup []byte)) string {
 func setHeaderEntries(h []byte, count, size uint32) {
 	binary.LittleEndian.PutUint32(h[80:84], count)
 	binary.LittleEndian.PutUint32(h[84:88], size)
+	fixHeaderCRC(h)
+}
+
+func fixHeaderCRC(h []byte) {
 	binary.LittleEndian.PutUint32(h[16:20], 0)
 	hs := binary.LittleEndian.Uint32(h[12:16])
 	binary.LittleEndian.PutUint32(h[16:20], crc32.ChecksumIEEE(h[:hs]))
@@ -131,5 +135,67 @@ func TestReadValidDiskStillReads(t *testing.T) {
 	}
 	if len(table.Partitions) != 1 || table.Partitions[0].Name != "data" {
 		t.Errorf("unexpected partitions %+v", table.Partitions)
+	}
+}
+
+// The bound refuses the primary header's array, the backup header and its array are valid: Read still returns the table,
+// from the backup (the refusal is a content error, so the backup is tried).
+func TestReadFallsBackToBackupWhenBoundRefusesPrimary(t *testing.T) {
+	path := writeBoundDisk(t, func(primary, backup []byte) {
+		setHeaderEntries(primary, 0x00100000, 0x1000)
+	})
+	_, table, err := readAllocated(t, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !table.RecoveredFromBackup || len(table.Partitions) != 1 || table.Partitions[0].Name != "data" {
+		t.Errorf("RecoveredFromBackup=%v partitions=%+v", table.RecoveredFromBackup, table.Partitions)
+	}
+}
+
+// moveArray copies the primary entry array (LBA 2, 128 entries x 128 bytes = 32 sectors) of a valid 4 MiB disk to
+// startLBA and points the primary header's PartitionEntryLBA there. The last LBA of the disk is 8191, so startLBA 8160
+// makes the array end exactly at the disk's last byte, and 8161 one sector past it.
+func moveArray(t *testing.T, startLBA uint64) string {
+	t.Helper()
+	path := writeBoundDisk(t, func(primary, backup []byte) {})
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	const arrayBytes = 128 * 128
+	array := make([]byte, arrayBytes)
+	if _, err := f.ReadAt(array, 2*512); err != nil {
+		t.Fatal(err)
+	}
+	// the array is written whole when it fits; the part past the end of the disk is not written
+	end := int64(4 << 20)
+	at := int64(startLBA) * 512
+	if _, err := f.WriteAt(array[:min(int64(arrayBytes), end-at)], at); err != nil {
+		t.Fatal(err)
+	}
+	var primary [512]byte
+	f.ReadAt(primary[:], 512)
+	binary.LittleEndian.PutUint64(primary[72:80], startLBA)
+	fixHeaderCRC(primary[:])
+	f.WriteAt(primary[:], 512)
+	// the backup header is overwritten by the array when it ends at the disk's last byte, as the layout says it must be
+	return path
+}
+
+// An array that ends exactly at the disk's last byte is read from the primary header (the bound is inclusive); one
+// that ends a sector past the disk is refused with the reason.
+func TestReadEntryArrayEndingAtLastByteOfDisk(t *testing.T) {
+	_, table, err := readAllocated(t, moveArray(t, 8160))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if table.RecoveredFromBackup || len(table.Partitions) != 1 {
+		t.Errorf("RecoveredFromBackup=%v partitions=%d", table.RecoveredFromBackup, len(table.Partitions))
+	}
+	_, table, err = readAllocated(t, moveArray(t, 8161))
+	if table != nil || err == nil || !strings.Contains(err.Error(), "partition entry array") || !strings.Contains(err.Error(), "does not fit") {
+		t.Fatalf("an array one sector past the disk: table %v, err %v", table, err)
 	}
 }
