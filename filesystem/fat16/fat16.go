@@ -212,6 +212,10 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	}
 
 	fatPrimaryStart := reservedSectors * bytesPerSector
+	if err := fat12.CheckFATFits(uint64(reservedSectors)*uint64(bytesPerSector), uint64(sectorsPerFat)*uint64(bytesPerSector),
+		int(fatCount), fat12.VolumeBytes(size, totalSectors, bytesPerSector)); err != nil {
+		return nil, err
+	}
 	fatSize := sectorsPerFat * bytesPerSector
 	fatSecondaryStart := fatPrimaryStart + fatSize
 	rootDirOff := fatSecondaryStart + fatSize

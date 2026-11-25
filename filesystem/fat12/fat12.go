@@ -308,6 +308,10 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 		return nil, fmt.Errorf("not a FAT12 filesystem: cluster count %d >= 4085", numClusters)
 	}
 
+	if err := CheckFATFits(uint64(reservedSectors)*uint64(bytesPerSector), uint64(sectorsPerFat)*uint64(bytesPerSector),
+		int(fatCount), VolumeBytes(size, totalSectors, bytesPerSector)); err != nil {
+		return nil, err
+	}
 	fatPrimaryStart := reservedSectors * bytesPerSector
 	fatSize := sectorsPerFat * bytesPerSector
 	fatSecondaryStart := fatPrimaryStart + fatSize
@@ -728,13 +732,37 @@ func (fs *FileSystem) SetRootDirLabel(volumeLabel string) error {
 
 // ── internal cluster / directory helpers ──────────────────────────────────────
 
+// maxDataCluster is the number of the last data cluster the volume holds: the data region (from dataStart to the end
+// of the volume) divided into clusters, numbered from 2 (Microsoft FAT32 File System Specification, "FAT Type
+// Determination": the valid data clusters are 2 .. CountofClusters+1). A FAT may have room for more entries than the
+// volume has clusters; an entry that names a cluster past this number names bytes that are not in the volume.
+func (fs *FileSystem) maxDataCluster() uint32 {
+	if fs.bytesPerCluster <= 0 || fs.size <= int64(fs.dataStart) {
+		return 1
+	}
+	n := (fs.size - int64(fs.dataStart)) / int64(fs.bytesPerCluster)
+	if n+1 > int64(fs.table.MaxCluster()) {
+		return fs.table.MaxCluster()
+	}
+	return uint32(n + 1)
+}
+
 func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
 	if firstCluster > fs.table.MaxCluster() || fs.table.ClusterValue(firstCluster) == 0 {
 		return nil, fmt.Errorf("invalid start cluster: %d", firstCluster)
 	}
+	last := fs.maxDataCluster()
+	if firstCluster > last {
+		return nil, fmt.Errorf("invalid start cluster: %d is past the last data cluster %d of the volume", firstCluster, last)
+	}
+	// A chain of distinct data clusters is at most last-1 long (clusters 2..last): a longer chain revisits a cluster.
+	maxLen := int(last) - 1
 	clusterList := make([]uint32, 0, 5)
 	cluster := firstCluster
 	for {
+		if len(clusterList) >= maxLen {
+			return nil, fmt.Errorf("invalid cluster chain from %d: it revisits a cluster (more than the %d data clusters of the volume)", firstCluster, maxLen)
+		}
 		clusterList = append(clusterList, cluster)
 		next := fs.table.ClusterValue(cluster)
 		if fs.table.IsEOC(next) {
@@ -743,12 +771,40 @@ func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
 		if next > fs.table.MaxCluster() {
 			return nil, fmt.Errorf("invalid cluster chain at %d", next)
 		}
+		if next > last {
+			return nil, fmt.Errorf("invalid cluster chain at %d: past the last data cluster %d of the volume", next, last)
+		}
 		if cluster < 2 {
 			return nil, fmt.Errorf("invalid cluster chain at %d", cluster)
 		}
 		cluster = next
 	}
 	return clusterList, nil
+}
+
+// VolumeBytes is the size of the volume a reader may rely on: the size the caller gives, or the volume's own
+// BPB_TotSec16 / BPB_TotSec32 sectors when it states fewer (0 states none).
+func VolumeBytes(size int64, totalSectors, bytesPerSector uint32) int64 {
+	if stated := int64(totalSectors) * int64(bytesPerSector); totalSectors != 0 && stated < size {
+		return stated
+	}
+	return size
+}
+
+// CheckFATFits refuses a FAT that does not fit in the volume. The reserved area, then fatCount copies of the FAT,
+// then the data region make up the volume (Microsoft FAT32 File System Specification: BPB_RsvdSecCnt, BPB_NumFATs,
+// BPB_FATSz16 / BPB_FATSz32, BPB_TotSec16 / BPB_TotSec32), so a volume of volumeBytes cannot hold more. The
+// readers allocate the FAT from its stated size; this check runs before they do.
+func CheckFATFits(reservedBytes, fatBytes uint64, fatCount int, volumeBytes int64) error {
+	if volumeBytes < 0 || fatCount < 0 {
+		return fmt.Errorf("FAT does not fit: volume of %d bytes, %d FAT copies", volumeBytes, fatCount)
+	}
+	if fatBytes > uint64(volumeBytes) || reservedBytes > uint64(volumeBytes) ||
+		fatBytes*uint64(fatCount) > uint64(volumeBytes)-reservedBytes {
+		return fmt.Errorf("FAT does not fit in the volume: %d reserved bytes + %d copies of a %d-byte FAT is more than the %d bytes of the volume",
+			reservedBytes, fatCount, fatBytes, volumeBytes)
+	}
+	return nil
 }
 
 // isRootCluster reports whether the given cluster location refers to the root directory.
@@ -882,6 +938,9 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*di
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read root directory: %w", err)
 	}
+	// The directories on the path so far, by first cluster. A subdirectory entry that names one of them makes the
+	// tree a cycle (a directory that holds itself or an ancestor), which no valid volume holds.
+	onPath := map[uint32]struct{}{rootCluster: {}}
 	if p == "." {
 		return currentDir, entries, nil
 	}
@@ -898,6 +957,11 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*di
 				return nil, nil, fmt.Errorf("cannot create directory at %s since it is a file",
 					"/"+strings.Join(paths[0:i+1], "/"))
 			}
+			if _, again := onPath[e.clusterLocation]; again {
+				return nil, nil, fmt.Errorf("directory cycle at %s: it names cluster %d, a directory already on the path",
+					"/"+strings.Join(paths[0:i+1], "/"), e.clusterLocation)
+			}
+			onPath[e.clusterLocation] = struct{}{}
 			found = true
 			currentDir = &Directory{directoryEntry: *e}
 			break

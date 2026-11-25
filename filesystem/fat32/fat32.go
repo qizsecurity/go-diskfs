@@ -3,6 +3,7 @@ package fat32
 import (
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/diskfs/go-diskfs/backend"
@@ -292,8 +293,23 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 
 	bytesPerSector := bs.biosParameterBlock.Dos331BPB.Dos20BPB.BytesPerSector
 	sectorsPerFat := bs.biosParameterBlock.sectorsPerFat
-	fatSize := sectorsPerFat * uint32(bytesPerSector)
 	reservedSectors := bs.biosParameterBlock.Dos331BPB.Dos20BPB.ReservedSectors
+	// The FAT is allocated from its stated size, twice (the two copies this reader compares). Refuse a FAT that is not
+	// in the volume, before anything is allocated (Microsoft FAT32 File System Specification: BPB_RsvdSecCnt,
+	// BPB_FATSz32, BPB_TotSec32). A FAT is at least the two reserved entries, 0 and 1.
+	totalSectors := bs.biosParameterBlock.Dos331BPB.TotalSectors32
+	if totalSectors == 0 {
+		totalSectors = uint32(bs.biosParameterBlock.Dos331BPB.Dos20BPB.TotalSectors)
+	}
+	fatBytes := uint64(sectorsPerFat) * uint64(bytesPerSector)
+	if fatBytes < 8 || fatBytes > math.MaxUint32 {
+		return nil, fmt.Errorf("FAT of %d bytes is not a FAT32 table", fatBytes)
+	}
+	if err := fat12.CheckFATFits(uint64(reservedSectors)*uint64(bytesPerSector), fatBytes, 2,
+		fat12.VolumeBytes(size, totalSectors, uint32(bytesPerSector))); err != nil {
+		return nil, err
+	}
+	fatSize := sectorsPerFat * uint32(bytesPerSector)
 	sectorsPerCluster := bs.biosParameterBlock.Dos331BPB.Dos20BPB.SectorsPerCluster
 	fatPrimaryStart := uint64(reservedSectors) * uint64(bytesPerSector)
 	fatSecondaryStart := fatPrimaryStart + uint64(fatSize)
