@@ -14,6 +14,7 @@ package fat32_test
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem"
+	"github.com/diskfs/go-diskfs/filesystem/fat12"
 	"github.com/diskfs/go-diskfs/filesystem/fat32"
 )
 
@@ -379,5 +381,157 @@ func TestHostileValidVolumeUnchanged(t *testing.T) {
 	got, err := io.ReadAll(f)
 	if err != nil || string(got) != "hello world, a file of the test\n" {
 		t.Fatalf("read %q err %v", got, err)
+	}
+}
+
+// hostileDAG builds a volume of k levels. Each level holds the directories X and Y, and Y is re-pointed at the cluster
+// of its sibling X, so there is no cycle but 2^k paths to the deepest directory, which holds one file.
+func hostileDAG(t *testing.T, k int) []byte {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "dag.img")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(hostileVolume); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := fat32.Create(file.New(f, false), hostileVolume, 0, hostileSectors, "DAG", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur := ""
+	for i := 0; i < k; i++ {
+		for _, d := range []string{"/X", "/Y"} {
+			if err := fs.Mkdir(cur + d); err != nil {
+				t.Fatalf("mkdir %s%s: %v", cur, d, err)
+			}
+		}
+		cur += "/X"
+	}
+	w, err := fs.OpenFile(cur+"/one.txt", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	_ = f.Close()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := uint32(2)
+	for i := 0; i < k; i++ {
+		_, x := rawEntry(t, b, dir, "X          ")
+		y, _ := rawEntry(t, b, dir, "Y          ")
+		setEntryCluster(b, y, x)
+		dir = x
+	}
+	return b
+}
+
+// walkOnce is the walk of a scanner with ReadDirOnce: it counts the directories listed, the second paths refused
+// (errors.Is ErrDirectoryAlreadyEntered) and the files seen.
+func walkOnce(t *testing.T, fs *fat32.FileSystem, dir string, listed, refused, files *int) {
+	t.Helper()
+	entries, err := fs.ReadDirOnce(dir)
+	if errors.Is(err, fat12.ErrDirectoryAlreadyEntered) {
+		*refused++
+		return
+	}
+	if err != nil {
+		t.Fatalf("ReadDirOnce(%s): %v", dir, err)
+	}
+	*listed++
+	for _, e := range entries {
+		if e.IsDir() {
+			walkOnce(t, fs, path.Join(dir, e.Name()), listed, refused, files)
+		} else {
+			*files++
+		}
+	}
+}
+
+// 16 levels, 65,536 paths to one file: each directory cluster is listed once, each second path is refused with the
+// named error, and the walk ends in under 1 s. (ReadDir walks every path: 12.8 s and 25 GiB allocated, measured by
+// the review of QIZ-6665.)
+func TestHostileDirectoryReachedByManyPathsIsEnteredOnce(t *testing.T) {
+	defer watchHeap(t)()
+	const k = 16
+	b := hostileDAG(t, k)
+	fs, err := hostileOpen(t, b)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	var listed, refused, files int
+	alloc, took := allocDuring(func() { walkOnce(t, fs, ".", &listed, &refused, &files) })
+	t.Logf("directories listed %d, second paths refused %d, files seen %d", listed, refused, files)
+	if listed != k+1 || refused != k || files != 1 {
+		t.Errorf("listed %d refused %d files %d, want %d, %d, 1", listed, refused, files, k+1, k)
+	}
+	requireBounded(t, alloc, took)
+}
+
+// The same directory listed twice by ReadDirOnce is refused the second time, with the named error and the path.
+func TestHostileReadDirOnceRefusesSecondListing(t *testing.T) {
+	fs, err := hostileOpen(t, hostileBase(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.ReadDirOnce("a"); err != nil {
+		t.Fatalf("first listing: %v", err)
+	}
+	_, err = fs.ReadDirOnce("a")
+	if !errors.Is(err, fat12.ErrDirectoryAlreadyEntered) || !strings.Contains(err.Error(), "a") {
+		t.Fatalf("second listing: got %v, want ErrDirectoryAlreadyEntered", err)
+	}
+}
+
+// A FAT of 511 MiB in a 1 GiB volume fits the volume (16 KiB + 2 x 511 MiB < 1 GiB), but the data region after it is
+// 2 MiB: only the entries 0 .. CountofClusters+1 are read. Before: +1,535 MiB allocated (3 x the stated FAT).
+func TestHostileLargeFATOfLargeVolumeReadsOnlyValidEntries(t *testing.T) {
+	defer watchHeap(t)()
+	const vol = 1 << 30
+	b := hostileBase(t)
+	binary.LittleEndian.PutUint32(b[0x20:], vol/hostileSectors)
+	binary.LittleEndian.PutUint32(b[0x24:], (vol/2-(64<<10))/hostileSectors)
+	p := filepath.Join(t.TempDir(), "big.img")
+	f, err := os.Create(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(vol); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	g, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer g.Close()
+	var rerr error
+	alloc, took := allocDuring(func() { _, rerr = fat32.Read(file.New(g, true), vol, 0, hostileSectors) })
+	t.Logf("Read: %v", rerr)
+	requireBounded(t, alloc, took)
+}
+
+// HeldBytes states what the reader holds for the FAT: 4 bytes for each entry 0 .. CountofClusters+1, not the FAT size.
+func TestHostileHeldBytesIsTheValidEntries(t *testing.T) {
+	b := hostileBase(t)
+	fs, err := hostileOpen(t, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved, spf := hostileGeometry(b)
+	spc := uint32(b[0x0D])
+	count := (uint32(len(b)) - (reserved+2*spf)*hostileSectors) / (spc * hostileSectors)
+	want := int64(count+2+1) * 4 // entries 0 .. count+1, one more slot as the table keeps it
+	if got := fs.HeldBytes(); got != want {
+		t.Errorf("HeldBytes = %d, want %d (FAT is %d bytes)", got, want, spf*hostileSectors)
 	}
 }

@@ -324,12 +324,27 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 		return nil, fmt.Errorf("error reading FileSystem Information Sector: %w", err)
 	}
 
-	partitionTableBytes := make([]byte, fatSize)
+	// Read the entries 0 .. CountofClusters+1 only. CountofClusters is the data region (the volume after the reserved
+	// area and the two FATs) in whole clusters; entries past MAX = CountofClusters+1 "must not be used" (Microsoft
+	// FAT32 File System Specification, "FAT Type Determination" and the FAT section). A FAT stated larger than the
+	// volume needs is then not read or held beyond them: the memory is (CountofClusters+2) x 4 bytes a table, not
+	// 3 x the stated FAT.
+	if sectorsPerCluster == 0 {
+		return nil, errors.New("sectors per cluster is zero")
+	}
+	volumeBytes := uint64(fat12.VolumeBytes(size, totalSectors, uint32(bytesPerSector)))
+	dataBytes := volumeBytes - fatPrimaryStart - 2*uint64(fatSize) // CheckFATFits: no underflow
+	countOfClusters := dataBytes / (uint64(sectorsPerCluster) * uint64(bytesPerSector))
+	readBytes := (countOfClusters + 2) * 4
+	if readBytes > uint64(fatSize) {
+		readBytes = uint64(fatSize)
+	}
+	partitionTableBytes := make([]byte, readBytes)
 	_, _ = b.ReadAt(partitionTableBytes, int64(fatPrimaryStart)+start)
-	fat := tableFromBytes(partitionTableBytes)
+	fat := tableFromBytesOfFAT(partitionTableBytes, fatSize)
 
 	_, _ = b.ReadAt(partitionTableBytes, int64(fatSecondaryStart)+start)
-	fat2 := tableFromBytes(partitionTableBytes)
+	fat2 := tableFromBytesOfFAT(partitionTableBytes, fatSize)
 	if !fat.equal(fat2) {
 		return nil, errors.New("fat tables did not match")
 	}

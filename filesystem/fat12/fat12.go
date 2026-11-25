@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/diskfs/go-diskfs/backend"
@@ -43,6 +44,10 @@ type FileSystem struct {
 	// the default fat12/16 boot-sector writer. FAT32 uses this to write the
 	// dos71EBPB-format boot sector (including backup sector).
 	WriteBootSectorFn func() error
+
+	// entered holds the first clusters of the directories ReadDirOnce has listed.
+	enteredMu sync.Mutex
+	entered   map[uint32]struct{}
 	// AfterWriteFAT, when non-nil, is called at the end of WriteFat. FAT32
 	// uses this to flush the FSInformationSector after every FAT change.
 	AfterWriteFAT func() error
@@ -322,8 +327,19 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	fatIDBase := uint32(0x0F00)
 	fatID := fatIDBase | uint32(dos20.MediaType)
 
-	tbl := newFat12Table(fatID, fatSize)
-	fatBytes := make([]byte, fatSize)
+	// Read the entries 0 .. CountofClusters+1 only: entries past the last valid cluster "must not be used" (Microsoft
+	// FAT32 File System Specification, "FAT Type Determination" and the FAT section), so a FAT stated larger than
+	// the volume needs is not read or held beyond them.
+	readBytes := (numClusters + 2) * 3 / 2
+	if (numClusters+2)*3%2 != 0 {
+		readBytes++
+	}
+	if readBytes > fatSize {
+		readBytes = fatSize
+	}
+	tbl := newFat12Table(fatID, readBytes)
+	tbl.size = fatSize
+	fatBytes := make([]byte, readBytes)
 	if _, err := b.ReadAt(fatBytes, int64(fatPrimaryStart)+start); err != nil {
 		return nil, fmt.Errorf("could not read FAT: %w", err)
 	}
@@ -789,6 +805,49 @@ func VolumeBytes(size int64, totalSectors, bytesPerSector uint32) int64 {
 		return stated
 	}
 	return size
+}
+
+// HeldBytes is what the reader holds in memory for the FAT: the in-memory table, 4 bytes for each entry it read
+// (entries 0 .. CountofClusters+1, never more than the FAT holds). A caller that charges memory to a budget charges
+// this once per opened volume; fat32.Read holds up to two more tables of this size while it opens the volume.
+func (fs *FileSystem) HeldBytes() int64 { return (int64(fs.table.MaxCluster()) + 1) * 4 }
+
+// ErrDirectoryAlreadyEntered is returned by ReadDirOnce for a directory whose first cluster an earlier ReadDirOnce
+// of this volume already listed.
+var ErrDirectoryAlreadyEntered = errors.New("directory already entered by another path")
+
+// ReadDirOnce is ReadDir, with one difference: a directory (named by its first cluster) is listed once per
+// FileSystem. A second path to the same cluster returns ErrDirectoryAlreadyEntered and no entries. A volume whose
+// directories share clusters has no cycle but more paths than clusters; walking every path costs time and output
+// that grow with the number of paths (2^k for k levels), not with the volume. A cluster belongs to one chain (the FAT
+// is "a singly linked list of the extents (clusters) of a file", Microsoft FAT32 File System Specification), so a
+// second directory entry for it is a cross-link, not a second directory. Use it for a walk of the whole tree.
+func (fs *FileSystem) ReadDirOnce(p string) ([]iofs.DirEntry, error) {
+	if err := validatePath(p); err != nil {
+		return nil, err
+	}
+	dir, entries, err := fs.readDirWithMkdir(p, false)
+	if err != nil {
+		return nil, fmt.Errorf("error reading directory %s: %w", p, err)
+	}
+	fs.enteredMu.Lock()
+	_, again := fs.entered[dir.clusterLocation]
+	if fs.entered == nil {
+		fs.entered = map[uint32]struct{}{}
+	}
+	fs.entered[dir.clusterLocation] = struct{}{}
+	fs.enteredMu.Unlock()
+	if again {
+		return nil, fmt.Errorf("directory %s (first cluster %d): %w", p, dir.clusterLocation, ErrDirectoryAlreadyEntered)
+	}
+	ret := make([]iofs.DirEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.isVolumeLabel || e.filenameShort == "" || e.filenameShort == ".." || e.filenameShort == "." {
+			continue
+		}
+		ret = append(ret, e)
+	}
+	return ret, nil
 }
 
 // CheckFATFits refuses a FAT that does not fit in the volume. The reserved area, then fatCount copies of the FAT,
