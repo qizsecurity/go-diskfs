@@ -118,7 +118,7 @@ func (fl *File) Read(b []byte) (int, error) {
 				var err error
 				input, err = fs.readBlock(location, block.compressed, block.size)
 				if err != nil {
-					return read, fmt.Errorf("error reading data block %d from squashfs: %v", i, err)
+					return read, fmt.Errorf("error reading data block %d from squashfs: %w", i, err)
 				}
 				// Cache the last block
 				fl.blockLocation = location
@@ -138,7 +138,7 @@ func (fl *File) Read(b []byte) (int, error) {
 		}
 		input, err := fs.readFragment(fl.fragmentBlockIndex, fl.fragmentOffset, fl.size()%fs.blocksize)
 		if err != nil {
-			return read, fmt.Errorf("error reading fragment block %d from squashfs: %v", fl.fragmentBlockIndex, err)
+			return read, fmt.Errorf("error reading fragment block %d from squashfs: %w", fl.fragmentBlockIndex, err)
 		}
 		pos = int64(len(fl.blockSizes)) * fs.blocksize
 		outputBlock(input)

@@ -61,6 +61,7 @@ func testCompressAndDecompress(t *testing.T, c Compressor, compressed []byte) {
 
 //nolint:thelper // this is not a helper function
 func testDecompress(t *testing.T, c Compressor, compressed []byte, errorStr string) {
+	withDictLimit(c, 8<<20) // the dictionary the writers of these tests declare by default
 	t.Run("decompress", func(t *testing.T) {
 		out, err := c.decompress(compressed, len(testCompressUncompressed))
 		switch {
@@ -86,6 +87,7 @@ func testDecompress(t *testing.T, c Compressor, compressed []byte, errorStr stri
 
 //nolint:thelper // this is not a helper function
 func testCompress(t *testing.T, c Compressor, errorStr string) {
+	withDictLimit(c, 8<<20)
 	t.Run("compress", func(t *testing.T) {
 		out, err := c.compress(testCompressUncompressed)
 		switch {

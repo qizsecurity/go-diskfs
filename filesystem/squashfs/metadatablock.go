@@ -33,7 +33,7 @@ func parseMetadata(b []byte, c Compressor) (block *metadatablock, err error) {
 	}
 	size, compressed, err := getMetadataSize(b[:2])
 	if err != nil {
-		return nil, fmt.Errorf("error reading metadata header: %v", err)
+		return nil, fmt.Errorf("error reading metadata header: %w", err)
 	}
 	if len(b) < int(2+size) {
 		return nil, fmt.Errorf("metadata header said size should be %d but was only %d", size, len(b)-2)
@@ -42,7 +42,7 @@ func parseMetadata(b []byte, c Compressor) (block *metadatablock, err error) {
 	if compressed {
 		data, err = c.decompress(data, standardMetadataBlocksize)
 		if err != nil {
-			return nil, fmt.Errorf("decompress error: %v", err)
+			return nil, fmt.Errorf("decompress error: %w", err)
 		}
 	}
 	return &metadatablock{
@@ -63,7 +63,7 @@ func (m *metadatablock) toBytes(c Compressor) ([]byte, error) {
 	} else {
 		data, err = c.compress(m.data)
 		if err != nil {
-			return nil, fmt.Errorf("compression error: %v", err)
+			return nil, fmt.Errorf("compression error: %w", err)
 		}
 	}
 	header |= uint16(len(data))
@@ -79,12 +79,17 @@ func (fs *FileSystem) readMetaBlock(r io.ReaderAt, c Compressor, location int64)
 		_, _ = r.ReadAt(b, location)
 		size, compressed, err := getMetadataSize(b)
 		if err != nil {
-			return nil, 0, fmt.Errorf("error getting size and compression for metadata block at %d: %v", location, err)
+			return nil, 0, fmt.Errorf("error getting size and compression for metadata block at %d: %w", location, err)
+		}
+		// The kernel refuses a metadata block whose size is 0 or more than SQUASHFS_METADATA_SIZE
+		// (fs/squashfs/block.c:324; squashfs_fs.h:19, :108), compressed or stored.
+		if size == 0 || size > standardMetadataBlocksize {
+			return nil, 0, fmt.Errorf("metadata block at %d has size %d, must be 1 to %d", location, size, standardMetadataBlocksize)
 		}
 		b = make([]byte, size)
 		read, err := r.ReadAt(b, location+2)
 		if err != nil && err != io.EOF {
-			return nil, 0, fmt.Errorf("unable to read metadata block of size %d at location %d: %v", size, location, err)
+			return nil, 0, fmt.Errorf("unable to read metadata block of size %d at location %d: %w", size, location, err)
 		}
 		if read != len(b) {
 			return nil, 0, fmt.Errorf("read %d instead of expected %d bytes for metadata block at location %d", read, size, location)
@@ -96,7 +101,7 @@ func (fs *FileSystem) readMetaBlock(r io.ReaderAt, c Compressor, location int64)
 			}
 			data, err = c.decompress(b, standardMetadataBlocksize)
 			if err != nil {
-				return nil, 0, fmt.Errorf("decompress error: %v", err)
+				return nil, 0, fmt.Errorf("decompress error: %w", err)
 			}
 		}
 		return data, size + 2, nil
