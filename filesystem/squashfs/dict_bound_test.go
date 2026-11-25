@@ -193,7 +193,7 @@ func TestReadRealXzImage(t *testing.T) {
 	// the paths and digests are those of the fixture's oracle (qiz-sbr handlers/testdata/squashfs/tree.xz.sqsh.oracle.txt)
 	for p, want := range map[string]string{
 		"a/small1.txt":  "323138f0a90f330f0f85b251c1b5e02c93633b1d8a339a1839b0000c04e1feb7", // a fragment
-		"a/b/c/big.bin": "fac590c320b8577b488299754229ba60d824cb1528a72890d307a773c739ae52",  // data blocks
+		"a/b/c/big.bin": "fac590c320b8577b488299754229ba60d824cb1528a72890d307a773c739ae52", // data blocks
 	} {
 		f, err := fs.Open(p)
 		if err != nil {
