@@ -40,6 +40,7 @@ func TestDecompressRefusesMoreThanMaxOut(t *testing.T) {
 		"zstd": &CompressorZstd{},
 	} {
 		t.Run(name, func(t *testing.T) {
+			withDictLimit(c, 8<<20)
 			bomb, err := c.compress(plain)
 			if err != nil {
 				t.Fatal(err)

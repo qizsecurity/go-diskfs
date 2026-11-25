@@ -36,7 +36,7 @@ func TestCompressorXz_DecompressBCJx86(t *testing.T) {
 		t.Fatalf("testdata is not a two-filter xz block (header %x)", compressed[12:14])
 	}
 
-	got, err := (&CompressorXz{}).decompress(compressed, len(plain))
+	got, err := withDictLimit(&CompressorXz{}, 131072).decompress(compressed, len(plain))
 	if err != nil {
 		t.Fatalf("decompress BCJ x86 + LZMA2 block: %v", err)
 	}

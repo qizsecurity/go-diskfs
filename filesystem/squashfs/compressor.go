@@ -31,6 +31,20 @@ func readAtMost(r io.Reader, maxOut int) ([]byte, error) {
 	return p, nil
 }
 
+// dictLimitFor is the largest dictionary a block of the file system may declare: max(block_size, SQUASHFS_METADATA_SIZE), the kernel's
+// default (fs/squashfs/xz_wrapper.c:66-67) and the most squashfs-tools writes (xz_wrapper.c:199-209, lzma_xz_wrapper.c:49).
+func dictLimitFor(blocksize int64) uint32 {
+	if blocksize < standardMetadataBlocksize {
+		return standardMetadataBlocksize
+	}
+	return uint32(blocksize)
+}
+
+// dictLimited is a compressor whose decoder allocates a dictionary that the stream declares. Read sets the bound from the file system.
+type dictLimited interface {
+	setDictLimit(uint32)
+}
+
 // Compressor defines a compressor. Fulfilled by various implementations in this package
 type Compressor interface {
 	compress([]byte) ([]byte, error)
@@ -48,6 +62,7 @@ type Compressor interface {
 
 // CompressorLzma lzma compression
 type CompressorLzma struct {
+	dictLimit uint32
 }
 
 func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
@@ -64,7 +79,20 @@ func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
+func (c *CompressorLzma) setDictLimit(n uint32) { c.dictLimit = n }
+
 func (c *CompressorLzma) decompress(in []byte, maxOut int) ([]byte, error) {
+	// LZMA alone header: properties u8, dictionary size u32 little endian, uncompressed size u64. The decoder allocates the dictionary the header
+	// declares (up to 2^32-1), so it is checked before the decoder is made.
+	if c.dictLimit == 0 {
+		return nil, fmt.Errorf("lzma: the dictionary limit of the file system is not set")
+	}
+	if len(in) < 13 {
+		return nil, fmt.Errorf("error creating lzma decompressor: header is %d bytes, need 13", len(in))
+	}
+	if d := binary.LittleEndian.Uint32(in[1:5]); d > c.dictLimit {
+		return nil, fmt.Errorf("lzma dictionary of %d bytes is above the %d bytes the file system allows", d, c.dictLimit)
+	}
 	b := bytes.NewReader(in)
 	lz, err := lzma.NewReader(b)
 	if err != nil {
@@ -189,6 +217,7 @@ const (
 
 // CompressorXz xz compression
 type CompressorXz struct {
+	dictLimit         uint32
 	DictionarySize    uint32
 	ExecutableFilters map[XzFilter]bool
 }
@@ -210,16 +239,23 @@ func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
+func (c *CompressorXz) setDictLimit(n uint32) { c.dictLimit = n }
+
 func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
+	// bcjxz.NewReader refuses a stream whose dictionary is above its second argument (xz-embedded's dict_max, as xz_dec_init(XZ_PREALLOC, dict_size)
+	// does in the kernel); zero would mean its own default of 64 MiB.
+	if c.dictLimit == 0 {
+		return nil, fmt.Errorf("xz: the dictionary limit of the file system is not set")
+	}
 	// Decode with github.com/therootcompany/xz, not ulikunitz/xz: mksquashfs
 	// -Xbcj <arch> (the "executable filter" of the xz compressor options)
 	// stores a block as an xz stream whose filter chain is BCJ + LZMA2, which
 	// ulikunitz/xz refuses ("xz: unsupported filter count"). therootcompany/xz
 	// is a port of the xz-embedded decoder and reads the BCJ x86, PowerPC,
-	// IA-64, ARM, ARM-Thumb and SPARC filters. A zero dictionary limit is that
-	// package's own default. compress is unchanged and still uses ulikunitz/xz.
+	// IA-64, ARM, ARM-Thumb and SPARC filters. dictLimit is its dictionary maximum;
+	// zero would be its own default of 64 MiB. compress is unchanged and still uses ulikunitz/xz.
 	b := bytes.NewReader(in)
-	xzReader, err := bcjxz.NewReader(b, 0)
+	xzReader, err := bcjxz.NewReader(b, c.dictLimit)
 	if err != nil {
 		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
 	}

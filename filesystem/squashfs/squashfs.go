@@ -202,6 +202,9 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	if err != nil {
 		return nil, fmt.Errorf("unable to create compressor: %v", err)
 	}
+	if dl, ok := compress.(dictLimited); ok {
+		dl.setDictLimit(dictLimitFor(int64(s.blocksize)))
+	}
 
 	// load fragments
 	fragments, err := readFragmentTable(s, b, compress)

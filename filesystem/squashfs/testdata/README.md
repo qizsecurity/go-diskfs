@@ -19,3 +19,7 @@ We make the `/foo` directory with sufficient entries to exceed a single sector (
 ## `read_test.sqs`
 
 This contains files of sizes around binary boundaries designed to exercise the corner cases in the block reading code.
+
+## tree.xz.sqs
+
+Copy of qiz-sbr `internal/binary/handlers/testdata/squashfs/tree.xz.sqsh` (mksquashfs from squashfs-tools in alpine 3.20, xz, 128 KiB blocks, no compressor options). Used by `dict_bound_test.go`; its file digests are those of the oracle that sits beside it in qiz-sbr.
