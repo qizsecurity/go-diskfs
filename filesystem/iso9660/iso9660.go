@@ -153,7 +153,7 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 		return nil, fmt.Errorf("requested size is too small to allow for system area (%d), one volume descriptor (%d), one volume descriptor set terminator (%d), and one block (%d)", systemAreaSize, volumeDescriptorSize, volumeDescriptorSize, blocksize)
 	}
 
-	// every location in the volume (ECMA-119 9.1.3, 8.4.18, path table locations) is a logical block number from the start of the volume (ECMA-119 6.2.1):
+	// every location in the volume (ECMA-119 9.1.3, 8.4.18, path table locations) is a logical block number, and Logical Block Number 0 is the block that begins with the first byte of the Volume Space (ECMA-119 4th edition, 2019: 6.2.2 Logical Block, 6.1.3 Volume Space):
 	// wrap the backend so a read at a block lands at start+block*blocksize, as the SquashFS reader does
 	if start != 0 {
 		b = backend.Sub(b, start, size)

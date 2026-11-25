@@ -10,7 +10,7 @@ import (
 )
 
 // A volume that begins at a non-zero start of the backend is read at that start in every structure: the root directory record and its SUSP area
-// (ECMA-119 8.4.18, 9.1.3: locations are block numbers from the start of the volume, 6.2.1), not only the volume descriptors.
+// (ECMA-119 8.4.18, 9.1.3: locations are logical block numbers; 6.2.2 Logical Block: block 0 begins with the first byte of the Volume Space, 6.1.3), not only the volume descriptors.
 func TestISO9660ReadAtStart(t *testing.T) {
 	for _, name := range []string{iso9660.ISO9660File, iso9660.RockRidgeFile} {
 		raw, err := os.ReadFile(name)
