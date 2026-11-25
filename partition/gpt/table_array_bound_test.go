@@ -40,11 +40,19 @@ func writeBoundDisk(t *testing.T, edit func(primary, backup []byte)) string {
 	defer f.Close()
 	last := int64(size/512-1) * 512
 	var primary, backup [512]byte
-	f.ReadAt(primary[:], 512)
-	f.ReadAt(backup[:], last)
+	if _, err := f.ReadAt(primary[:], 512); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ReadAt(backup[:], last); err != nil {
+		t.Fatal(err)
+	}
 	edit(primary[:], backup[:])
-	f.WriteAt(primary[:], 512)
-	f.WriteAt(backup[:], last)
+	if _, err := f.WriteAt(primary[:], 512); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(backup[:], last); err != nil {
+		t.Fatal(err)
+	}
 	return path
 }
 
@@ -128,7 +136,7 @@ func TestReadRefusesEntryArrayThatOverflows(t *testing.T) {
 
 // A valid disk still reads, and the bound is not a stricter rule than the disk: the array of a valid disk is read.
 func TestReadValidDiskStillReads(t *testing.T) {
-	path := writeBoundDisk(t, func(primary, backup []byte) {})
+	path := writeBoundDisk(t, func(_, _ []byte) {})
 	_, table, err := readAllocated(t, path)
 	if err != nil {
 		t.Fatal(err)
@@ -141,7 +149,7 @@ func TestReadValidDiskStillReads(t *testing.T) {
 // The bound refuses the primary header's array, the backup header and its array are valid: Read still returns the table,
 // from the backup (the refusal is a content error, so the backup is tried).
 func TestReadFallsBackToBackupWhenBoundRefusesPrimary(t *testing.T) {
-	path := writeBoundDisk(t, func(primary, backup []byte) {
+	path := writeBoundDisk(t, func(primary, _ []byte) {
 		setHeaderEntries(primary, 0x00100000, 0x1000)
 	})
 	_, table, err := readAllocated(t, path)
@@ -158,7 +166,7 @@ func TestReadFallsBackToBackupWhenBoundRefusesPrimary(t *testing.T) {
 // makes the array end exactly at the disk's last byte, and 8161 one sector past it.
 func moveArray(t *testing.T, startLBA uint64) string {
 	t.Helper()
-	path := writeBoundDisk(t, func(primary, backup []byte) {})
+	path := writeBoundDisk(t, func(_, _ []byte) {})
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -176,10 +184,14 @@ func moveArray(t *testing.T, startLBA uint64) string {
 		t.Fatal(err)
 	}
 	var primary [512]byte
-	f.ReadAt(primary[:], 512)
+	if _, err := f.ReadAt(primary[:], 512); err != nil {
+		t.Fatal(err)
+	}
 	binary.LittleEndian.PutUint64(primary[72:80], startLBA)
 	fixHeaderCRC(primary[:])
-	f.WriteAt(primary[:], 512)
+	if _, err := f.WriteAt(primary[:], 512); err != nil {
+		t.Fatal(err)
+	}
 	// the backup header is overwritten by the array when it ends at the disk's last byte, as the layout says it must be
 	return path
 }
