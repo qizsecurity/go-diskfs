@@ -713,6 +713,20 @@ func readBackup(f backend.File, logicalBlockSize, physicalBlockSize int, seconda
 // content errors are wrapped in *primaryContentError so the caller can
 // route them to the backup fallback if appropriate.
 func loadEntries(f backend.File, gptTable *Table, logicalBlockSize, physicalBlockSize int) (*Table, error) {
+	// The header states the array: NumberOfPartitionEntries x SizeOfPartitionEntry bytes from PartitionEntryLBA
+	// (UEFI 2.10 section 5.3.2, Table 5.5). Both fields come from the disk, and a header CRC proves only that the header
+	// was not damaged, so an array that does not end inside the disk is refused before it is allocated. The product of
+	// two 32-bit fields fits in 64 bits.
+	diskSize, err := seekDiskSize(f)
+	if err != nil {
+		return nil, fmt.Errorf("cannot determine disk size to check the partition entry array: %w", err)
+	}
+	arrayBytes := uint64(gptTable.partitionArraySize) * uint64(gptTable.partitionEntrySize)
+	arrayStart := gptTable.partitionFirstLBA * uint64(logicalBlockSize)
+	if diskSize < 0 || arrayStart/uint64(logicalBlockSize) != gptTable.partitionFirstLBA || arrayStart > uint64(diskSize) || arrayBytes > uint64(diskSize)-arrayStart {
+		return nil, &primaryContentError{fmt.Errorf("partition entry array of %d entries x %d bytes at LBA %d does not fit in the disk of %d bytes",
+			gptTable.partitionArraySize, gptTable.partitionEntrySize, gptTable.partitionFirstLBA, diskSize)}
+	}
 	start, size := gptTable.calculatePartitionArrayLocations()
 	b := make([]byte, size)
 	read, err := f.ReadAt(b, int64(start))
