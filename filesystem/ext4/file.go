@@ -62,16 +62,14 @@ func (fl *File) Read(b []byte) (int, error) {
 	}
 	var previousEnd int64
 	for _, extent := range fl.extents {
+		// the extent parser (extent.go) has already taken the unwritten flag out of ee_len: count is the length in blocks
 		count := int64(extent.count)
-		if count > 32768 {
-			count -= 32768
-		}
 		start := int64(extent.fileBlock) * blockSize
 		end := start + count*blockSize
 		if count == 0 || start < previousEnd {
 			return 0, fmt.Errorf("invalid ext4 extent order or length")
 		}
-		if extent.count <= 32768 && (extent.startingBlock > uint64(math.MaxInt64)/uint64(blockSize) ||
+		if !extent.unwritten && (extent.startingBlock > uint64(math.MaxInt64)/uint64(blockSize) ||
 			int64(extent.startingBlock)*blockSize > math.MaxInt64-count*blockSize) {
 			return 0, fmt.Errorf("ext4 extent address overflows")
 		}
@@ -85,10 +83,7 @@ func (fl *File) Read(b []byte) (int, error) {
 	clear(b[:want])
 	for _, extent := range fl.extents {
 		count := int64(extent.count)
-		unwritten := count > 32768
-		if unwritten {
-			count -= 32768
-		}
+		unwritten := extent.unwritten
 		extentStart := int64(extent.fileBlock) * blockSize
 		extentEnd := extentStart + count*blockSize
 		if extentStart >= end {
