@@ -85,11 +85,12 @@ func (fl *File) Read(b []byte) (int, error) {
 		}
 		// the bytes left to read in the extent or in the hole
 		var leftHere int64
-		if covering != nil {
+		switch {
+		case covering != nil:
 			leftHere = (int64(covering.fileBlock)+int64(covering.count))*int64(blocksize) - fl.offset
-		} else if nextStart != math.MaxUint64 {
+		case nextStart != math.MaxUint64:
 			leftHere = int64(nextStart*blocksize) - fl.offset
-		} else {
+		default:
 			leftHere = bytesToRead - readBytes
 		}
 		toReadHere := min(bytesToRead-readBytes, leftHere)

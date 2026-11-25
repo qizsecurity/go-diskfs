@@ -1,6 +1,7 @@
 package ext4
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 )
@@ -23,7 +24,7 @@ func TestQizReadHolesAndUnwrittenExtents(t *testing.T) {
 				if !ok {
 					t.Fatalf("no oracle row for %s", p)
 				}
-				if diffs := qizCompareRow(fsys, r); len(diffs) > 0 {
+				if diffs := qizCompareRow(fsys, &r); len(diffs) > 0 {
 					t.Errorf("%s: %v", p, diffs)
 				}
 			}
@@ -74,7 +75,7 @@ func TestQizReadHolesOddBuffers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s chunk %d: %v", p, chunk, err)
 			}
-			if string(got) != string(whole) {
+			if !bytes.Equal(got, whole) {
 				t.Errorf("%s chunk %d: bytes differ from the whole-file read", p, chunk)
 			}
 		}
@@ -119,7 +120,7 @@ func TestQizExtentUnwrittenLength(t *testing.T) {
 				tt.eeLen, exts[0].count, exts[0].unwritten, tt.count, tt.unwritten)
 		}
 		// writing the node back must give the same ee_len
-		if got := f.toBytes(); string(got[12:24]) != string(in[12:24]) {
+		if got := f.toBytes(); !bytes.Equal(got[12:24], in[12:24]) {
 			t.Errorf("ee_len %d: toBytes gave % x, want % x", tt.eeLen, got[12:24], in[12:24])
 		}
 	}

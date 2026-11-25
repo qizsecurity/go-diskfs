@@ -38,7 +38,7 @@ func TestQizBlockMappedOracleRows(t *testing.T) {
 					t.Errorf("%s: panic: %v", r.path, p)
 				}
 			}()
-			diffs := qizCompareRow(fsys, r)
+			diffs := qizCompareRow(fsys, &r)
 			if len(diffs) == 0 {
 				t.Logf("%s: matches the oracle", r.path)
 			}

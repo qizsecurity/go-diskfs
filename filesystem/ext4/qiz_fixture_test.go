@@ -176,7 +176,7 @@ func (d qizDiff) String() string { return d.field + ": " + d.text }
 // qizCompareRow compares one oracle row with what the reader reports. It returns the fields
 // that differ, each with both values, and the operations that failed. Nothing is returned
 // when all equal.
-func qizCompareRow(fsys *FileSystem, r qizOracleRow) []qizDiff {
+func qizCompareRow(fsys *FileSystem, r *qizOracleRow) []qizDiff {
 	var diffs []qizDiff
 	st, err := fsys.Stat(r.path)
 	if err != nil {
@@ -257,7 +257,7 @@ func qizCompareAll(t *testing.T, fsys *FileSystem, rows []qizOracleRow) map[stri
 	t.Helper()
 	out := map[string][]qizDiff{}
 	for _, r := range rows {
-		if d := qizCompareRow(fsys, r); len(d) > 0 {
+		if d := qizCompareRow(fsys, &r); len(d) > 0 {
 			out[r.path] = d
 		}
 	}
