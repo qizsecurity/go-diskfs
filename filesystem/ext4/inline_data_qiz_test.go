@@ -90,7 +90,7 @@ func TestQizInlineDataOracleRows(t *testing.T) {
 					diffs = []qizDiff{{"panic", fmt.Sprint(p), nil}}
 				}
 			}()
-			diffs = qizCompareRow(fsys, r)
+			diffs = qizCompareRow(fsys, &r)
 		}()
 		for _, d := range diffs {
 			t.Errorf("%s: %v", r.path, d)
@@ -155,7 +155,7 @@ func TestQizInlineDataSymlinkInode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt(mut, int64(pos)); err != nil {
+	if _, err := f.WriteAt(mut, pos); err != nil {
 		t.Fatal(err)
 	}
 	f.Close()

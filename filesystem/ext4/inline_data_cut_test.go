@@ -115,7 +115,7 @@ func TestInlineDataTreeMatchesKernelOracle(t *testing.T) {
 		}
 	}
 	walk(".")
-	var paths []string
+	paths := make([]string, 0, len(want))
 	for p := range want {
 		paths = append(paths, p)
 	}
