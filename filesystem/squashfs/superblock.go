@@ -197,6 +197,10 @@ func parseSuperblock(b []byte) (*superblock, error) {
 	}
 
 	blocksize := binary.LittleEndian.Uint32(b[12:16])
+	// the kernel refuses a block size above SQUASHFS_FILE_MAX_SIZE, 1 MiB (fs/squashfs/super.c:260; squashfs_fs.h:29)
+	if int64(blocksize) > maxBlocksize {
+		return nil, fmt.Errorf("superblock block size %d is above the maximum %d", blocksize, maxBlocksize)
+	}
 	blocklog := binary.LittleEndian.Uint16(b[22:24])
 	expectedLog := uint16(math.Log2(float64(blocksize)))
 	if expectedLog != blocklog {

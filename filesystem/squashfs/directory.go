@@ -58,7 +58,7 @@ func parseDirectory(b []byte) (*directory, error) {
 	for pos := 0; pos+dirHeaderSize <= len(b); {
 		directoryHeader, err := parseDirectoryHeader(b[pos:])
 		if err != nil {
-			return nil, fmt.Errorf("could not parse directory header: %v", err)
+			return nil, fmt.Errorf("could not parse directory header: %w", err)
 		}
 		if directoryHeader.count == 0 {
 			return nil, fmt.Errorf("corrupted directory, must have at least one entry")
@@ -70,7 +70,7 @@ func parseDirectory(b []byte) (*directory, error) {
 		for count := uint32(0); count < directoryHeader.count; count++ {
 			entry, size, err := parseDirectoryEntry(b[pos:], directoryHeader.inode)
 			if err != nil {
-				return nil, fmt.Errorf("unable to parse entry at position %d: %v", pos, err)
+				return nil, fmt.Errorf("unable to parse entry at position %d: %w", pos, err)
 			}
 			entry.startBlock = directoryHeader.startBlock
 			entries = append(entries, entry)

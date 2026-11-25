@@ -31,18 +31,101 @@ func readAtMost(r io.Reader, maxOut int) ([]byte, error) {
 	return p, nil
 }
 
-// dictLimitFor is the largest dictionary a block of the file system may declare: max(block_size, SQUASHFS_METADATA_SIZE), the kernel's
-// default (fs/squashfs/xz_wrapper.c:66-67) and the most squashfs-tools writes (xz_wrapper.c:199-209, lzma_xz_wrapper.c:49).
-func dictLimitFor(blocksize int64) uint32 {
-	if blocksize < standardMetadataBlocksize {
-		return standardMetadataBlocksize
-	}
-	return uint32(blocksize)
+// DictionaryLimit is asked, for every block an xz or lzma decoder decodes, whether the dictionary the block's stream declares may be
+// allocated. It is called with the declared size in bytes BEFORE the decoder allocates it. An error refuses the block; otherwise the
+// returned release is called when the decoder has finished with the block (a nil release is allowed).
+type DictionaryLimit func(declared int64) (release func(), err error)
+
+// DictionaryError is the error of a block whose declared dictionary the DictionaryLimit refused. Err is the limit's own error.
+type DictionaryError struct {
+	Declared int64
+	Err      error
 }
 
-// dictLimited is a compressor whose decoder allocates a dictionary that the stream declares. Read sets the bound from the file system.
-type dictLimited interface {
-	setDictLimit(uint32)
+func (e *DictionaryError) Error() string {
+	return fmt.Sprintf("the dictionary of %d bytes the stream declares is refused: %v", e.Declared, e.Err)
+}
+
+func (e *DictionaryError) Unwrap() error { return e.Err }
+
+// dictionaryLimited is a compressor whose decoder allocates a dictionary that the stream declares. Read sets the limit it was given.
+type dictionaryLimited interface {
+	setDictionaryLimit(DictionaryLimit)
+}
+
+// askDictionary asks the limit, as above. A decoder with no limit set refuses to run.
+func askDictionary(l DictionaryLimit, declared int64) (func(), error) {
+	if l == nil {
+		return nil, fmt.Errorf("the dictionary limit is not set: pass WithDictionaryLimit to Read")
+	}
+	release, err := l(declared)
+	if err != nil {
+		return nil, &DictionaryError{Declared: declared, Err: err}
+	}
+	if release == nil {
+		release = func() {}
+	}
+	return release, nil
+}
+
+// xzDeclaredDictionary reads, from the first block header of an xz stream, the dictionary size of its LZMA2 filter. xz file format: stream header
+// 12 bytes (3.1); block header (3.1.3, 5.3.1): size byte (real size = (b+1)*4), flags (bits 0-1: filters-1, bit 6: compressed size present,
+// bit 7: uncompressed size present), those sizes as variable-length integers, then each filter: id, size of properties, properties. LZMA2 is
+// filter 0x21 with one properties byte (5.3.4): bits 0-5 give the size (40 is 4 GiB-1), (2 | (bits & 1)) << (bits / 2 + 11).
+func xzDeclaredDictionary(in []byte) (int64, error) {
+	const streamHeader = 12
+	if len(in) < streamHeader+2 || in[streamHeader] == 0 {
+		return 0, fmt.Errorf("xz: no block header")
+	}
+	end := streamHeader + (int(in[streamHeader])+1)*4
+	if end > len(in) {
+		return 0, fmt.Errorf("xz: block header of %d bytes is cut", end-streamHeader)
+	}
+	flags := in[streamHeader+1]
+	p := streamHeader + 2
+	varint := func() (uint64, bool) {
+		var v uint64
+		for i := 0; i < 9 && p < end; i++ {
+			c := in[p]
+			p++
+			v |= uint64(c&0x7f) << (7 * uint(i))
+			if c&0x80 == 0 {
+				return v, true
+			}
+		}
+		return 0, false
+	}
+	for _, bit := range []byte{0x40, 0x80} {
+		if flags&bit != 0 {
+			if _, ok := varint(); !ok {
+				return 0, fmt.Errorf("xz: block header sizes are cut")
+			}
+		}
+	}
+	for i := 0; i <= int(flags&3); i++ {
+		id, ok := varint()
+		if !ok {
+			return 0, fmt.Errorf("xz: filter flags are cut")
+		}
+		n, ok := varint()
+		if !ok || p+int(n) > end {
+			return 0, fmt.Errorf("xz: filter properties are cut")
+		}
+		props := in[p : p+int(n)]
+		p += int(n)
+		if id != 0x21 {
+			continue
+		}
+		if len(props) != 1 || props[0]&0x3f > 40 {
+			return 0, fmt.Errorf("xz: the LZMA2 properties are not valid")
+		}
+		bits := int64(props[0] & 0x3f)
+		if bits == 40 {
+			return 1<<32 - 1, nil
+		}
+		return (2 | (bits & 1)) << (bits/2 + 11), nil
+	}
+	return 0, fmt.Errorf("xz: the block has no LZMA2 filter")
 }
 
 // Compressor defines a compressor. Fulfilled by various implementations in this package
@@ -62,7 +145,7 @@ type Compressor interface {
 
 // CompressorLzma lzma compression
 type CompressorLzma struct {
-	dictLimit uint32
+	dictLimit DictionaryLimit
 }
 
 func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
@@ -79,20 +162,19 @@ func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorLzma) setDictLimit(n uint32) { c.dictLimit = n }
+func (c *CompressorLzma) setDictionaryLimit(l DictionaryLimit) { c.dictLimit = l }
 
 func (c *CompressorLzma) decompress(in []byte, maxOut int) ([]byte, error) {
 	// LZMA alone header: properties u8, dictionary size u32 little endian, uncompressed size u64. The decoder allocates the dictionary the header
-	// declares (up to 2^32-1), so it is checked before the decoder is made.
-	if c.dictLimit == 0 {
-		return nil, fmt.Errorf("lzma: the dictionary limit of the file system is not set")
+	// declares (up to 2^32-1), so the limit is asked before the decoder is made.
+	if len(in) < 5 {
+		return nil, fmt.Errorf("error creating lzma decompressor: header is %d bytes, need 5", len(in))
 	}
-	if len(in) < 13 {
-		return nil, fmt.Errorf("error creating lzma decompressor: header is %d bytes, need 13", len(in))
+	release, err := askDictionary(c.dictLimit, int64(binary.LittleEndian.Uint32(in[1:5])))
+	if err != nil {
+		return nil, err
 	}
-	if d := binary.LittleEndian.Uint32(in[1:5]); d > c.dictLimit {
-		return nil, fmt.Errorf("lzma dictionary of %d bytes is above the %d bytes the file system allows", d, c.dictLimit)
-	}
+	defer release()
 	b := bytes.NewReader(in)
 	lz, err := lzma.NewReader(b)
 	if err != nil {
@@ -217,7 +299,7 @@ const (
 
 // CompressorXz xz compression
 type CompressorXz struct {
-	dictLimit         uint32
+	dictLimit         DictionaryLimit
 	DictionarySize    uint32
 	ExecutableFilters map[XzFilter]bool
 }
@@ -239,23 +321,27 @@ func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 	}
 	return b.Bytes(), nil
 }
-func (c *CompressorXz) setDictLimit(n uint32) { c.dictLimit = n }
+func (c *CompressorXz) setDictionaryLimit(l DictionaryLimit) { c.dictLimit = l }
 
 func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
-	// bcjxz.NewReader refuses a stream whose dictionary is above its second argument (xz-embedded's dict_max, as xz_dec_init(XZ_PREALLOC, dict_size)
-	// does in the kernel); zero would mean its own default of 64 MiB.
-	if c.dictLimit == 0 {
-		return nil, fmt.Errorf("xz: the dictionary limit of the file system is not set")
+	declared, err := xzDeclaredDictionary(in)
+	if err != nil {
+		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
 	}
+	release, err := askDictionary(c.dictLimit, declared)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	// Decode with github.com/therootcompany/xz, not ulikunitz/xz: mksquashfs
 	// -Xbcj <arch> (the "executable filter" of the xz compressor options)
 	// stores a block as an xz stream whose filter chain is BCJ + LZMA2, which
 	// ulikunitz/xz refuses ("xz: unsupported filter count"). therootcompany/xz
 	// is a port of the xz-embedded decoder and reads the BCJ x86, PowerPC,
-	// IA-64, ARM, ARM-Thumb and SPARC filters. dictLimit is its dictionary maximum;
-	// zero would be its own default of 64 MiB. compress is unchanged and still uses ulikunitz/xz.
+	// IA-64, ARM, ARM-Thumb and SPARC filters. Its dictionary maximum is the size the
+	// caller's limit accepted, so a later stream of the input that declares more fails (ErrMemlimit). compress is unchanged and still uses ulikunitz/xz.
 	b := bytes.NewReader(in)
-	xzReader, err := bcjxz.NewReader(b, c.dictLimit)
+	xzReader, err := bcjxz.NewReader(b, uint32(declared))
 	if err != nil {
 		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
 	}
