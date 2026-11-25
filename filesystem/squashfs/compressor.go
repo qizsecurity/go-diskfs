@@ -15,14 +15,31 @@ import (
 	"github.com/ulikunitz/xz/lzma"
 )
 
+// readAtMost reads r to EOF and returns what it read. It reads at most maxOut+1 bytes: more than maxOut bytes
+// is an error, so a block that decodes to more than the caller's bound is never held in memory.
+func readAtMost(r io.Reader, maxOut int) ([]byte, error) {
+	if maxOut <= 0 {
+		return nil, fmt.Errorf("maxOut must be > 0, got %d", maxOut)
+	}
+	p, err := io.ReadAll(io.LimitReader(r, int64(maxOut)+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(p) > maxOut {
+		return nil, fmt.Errorf("decompressed data is larger than the %d bytes a block may hold", maxOut)
+	}
+	return p, nil
+}
+
 // Compressor defines a compressor. Fulfilled by various implementations in this package
 type Compressor interface {
 	compress([]byte) ([]byte, error)
 	// decompress decodes a compressed block. maxOut is the caller's known
 	// upper bound on the decompressed size (SquashFS metadata blocks are
 	// always <= standardMetadataBlocksize; data/fragment blocks are always
-	// <= the filesystem's blocksize) -- every compressor except
-	// CompressorLz4 ignores it; their behaviour is unchanged.
+	// <= the filesystem's blocksize). A block that decodes to more than
+	// maxOut bytes is an error and is never held in memory past maxOut+1
+	// bytes; maxOut <= 0 is an error.
 	decompress(in []byte, maxOut int) ([]byte, error)
 	loadOptions([]byte) error
 	optionsBytes() []byte
@@ -48,13 +65,12 @@ func (c *CompressorLzma) compress(in []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 func (c *CompressorLzma) decompress(in []byte, maxOut int) ([]byte, error) {
-	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	lz, err := lzma.NewReader(b)
 	if err != nil {
 		return nil, fmt.Errorf("error creating lzma decompressor: %v", err)
 	}
-	p, err := io.ReadAll(lz)
+	p, err := readAtMost(lz, maxOut)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing: %v", err)
 	}
@@ -109,13 +125,12 @@ func (c *CompressorGzip) compress(in []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 func (c *CompressorGzip) decompress(in []byte, maxOut int) ([]byte, error) {
-	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	gz, err := zlib.NewReader(b)
 	if err != nil {
 		return nil, fmt.Errorf("error creating gzip decompressor: %v", err)
 	}
-	p, err := io.ReadAll(gz)
+	p, err := readAtMost(gz, maxOut)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing: %v", err)
 	}
@@ -196,7 +211,6 @@ func (c *CompressorXz) compress(in []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
-	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	// Decode with github.com/therootcompany/xz, not ulikunitz/xz: mksquashfs
 	// -Xbcj <arch> (the "executable filter" of the xz compressor options)
 	// stores a block as an xz stream whose filter chain is BCJ + LZMA2, which
@@ -209,7 +223,7 @@ func (c *CompressorXz) decompress(in []byte, maxOut int) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error creating xz decompressor: %v", err)
 	}
-	p, err := io.ReadAll(xzReader)
+	p, err := readAtMost(xzReader, maxOut)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing: %v", err)
 	}
@@ -391,13 +405,12 @@ func (c *CompressorZstd) compress(in []byte) ([]byte, error) {
 	return b.Bytes(), nil
 }
 func (c *CompressorZstd) decompress(in []byte, maxOut int) ([]byte, error) {
-	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
-	z, err := zstd.NewReader(nil)
+	z, err := zstd.NewReader(bytes.NewReader(in), zstd.WithDecoderConcurrency(1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd decompressor: %w", err)
 	}
 	defer z.Close()
-	p, err := z.DecodeAll(in, nil)
+	p, err := readAtMost(z, maxOut)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing zstd: %w", err)
 	}
@@ -411,10 +424,9 @@ func (c *CompressorLzo) compress(_ []byte) ([]byte, error) {
 	return nil, fmt.Errorf("LZO compression not yet supported")
 }
 func (c *CompressorLzo) decompress(in []byte, maxOut int) ([]byte, error) {
-	_ = maxOut // unused: this decoder streams to EOF, unlike the raw LZ4 block format
 	b := bytes.NewReader(in)
 	lz := lzo.NewReader(b)
-	p, err := io.ReadAll(lz)
+	p, err := readAtMost(lz, maxOut)
 	if err != nil {
 		return nil, fmt.Errorf("error decompressing: %v", err)
 	}

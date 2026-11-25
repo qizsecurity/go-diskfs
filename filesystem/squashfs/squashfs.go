@@ -906,6 +906,14 @@ func readXattrsTable(s *superblock, file backend.File, c Compressor) (*xAttrTabl
 		fs           = &FileSystem{}
 	)
 
+	locns := make([]uint64, 0, len(b)/8)
+	for i := 0; i+8-1 < len(b); i += 8 {
+		locns = append(locns, binary.LittleEndian.Uint64(b[i:i+8]))
+	}
+	if err := validateXattrIndex(locns, xAttrStart, s.xattrTableStart); err != nil {
+		return nil, err
+	}
+
 	bIndex := make([]byte, 0)
 	// convert those into indexes
 	for i := 0; i+8-1 < len(b); i += 8 {

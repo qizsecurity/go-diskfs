@@ -89,3 +89,28 @@ func (x *xAttrTable) find(pos int) (map[string]string, error) {
 	}
 	return xattrs, nil
 }
+
+// validateXattrIndex applies the checks of Linux fs/squashfs/xattr_id.c squashfs_read_xattr_id_table (v6.12, lines 79-124)
+// to the locations of the xattr id blocks (the index that follows the table header): each location is above the one
+// before, and the gap is at most SQUASHFS_METADATA_SIZE + SQUASHFS_BLOCK_OFFSET (8192 + 2); the last id block is before
+// idTableStart (the superblock's xattr_id_table_start) by at most that; dataStart (the xattr table's start) is before
+// the first id block. So the xattr data, read from dataStart up to the first id block, lies wholly before idTableStart.
+func validateXattrIndex(locns []uint64, dataStart, idTableStart uint64) error {
+	maxGap := uint64(standardMetadataBlocksize) + 2
+	if len(locns) == 0 {
+		return fmt.Errorf("xattr id table has no index entries")
+	}
+	for i := 0; i+1 < len(locns); i++ {
+		if locns[i] >= locns[i+1] || locns[i+1]-locns[i] > maxGap {
+			return fmt.Errorf("xattr id block %d at %d and block %d at %d: locations must rise by at most %d", i, locns[i], i+1, locns[i+1], maxGap)
+		}
+	}
+	last := locns[len(locns)-1]
+	if last >= idTableStart || idTableStart-last > maxGap {
+		return fmt.Errorf("last xattr id block at %d must be before the xattr id table at %d by at most %d", last, idTableStart, maxGap)
+	}
+	if dataStart >= locns[0] {
+		return fmt.Errorf("xattr table start %d must be before the first xattr id block at %d", dataStart, locns[0])
+	}
+	return nil
+}

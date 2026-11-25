@@ -81,6 +81,11 @@ func (fs *FileSystem) readMetaBlock(r io.ReaderAt, c Compressor, location int64)
 		if err != nil {
 			return nil, 0, fmt.Errorf("error getting size and compression for metadata block at %d: %v", location, err)
 		}
+		// The kernel refuses a metadata block whose size is 0 or more than SQUASHFS_METADATA_SIZE
+		// (fs/squashfs/block.c:324; squashfs_fs.h:19, :108), compressed or stored.
+		if size == 0 || size > standardMetadataBlocksize {
+			return nil, 0, fmt.Errorf("metadata block at %d has size %d, must be 1 to %d", location, size, standardMetadataBlocksize)
+		}
 		b = make([]byte, size)
 		read, err := r.ReadAt(b, location+2)
 		if err != nil && err != io.EOF {
