@@ -212,6 +212,10 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	}
 
 	fatPrimaryStart := reservedSectors * bytesPerSector
+	if err := fat12.CheckFATFits(uint64(reservedSectors)*uint64(bytesPerSector), uint64(sectorsPerFat)*uint64(bytesPerSector),
+		int(fatCount), fat12.VolumeBytes(size, totalSectors, bytesPerSector)); err != nil {
+		return nil, err
+	}
 	fatSize := sectorsPerFat * bytesPerSector
 	fatSecondaryStart := fatPrimaryStart + fatSize
 	rootDirOff := fatSecondaryStart + fatSize
@@ -219,8 +223,14 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	bytesPerCluster := int(sectorsPerCluster) * int(bytesPerSector)
 
 	fatID := uint32(0xFF00) | uint32(dos20.MediaType)
-	tbl := newFat16Table(fatID, fatSize)
-	fatBytes := make([]byte, fatSize)
+	// Read the entries 0 .. CountofClusters+1 only (see fat12.Read).
+	readBytes := (numClusters + 2) * 2
+	if readBytes > fatSize {
+		readBytes = fatSize
+	}
+	tbl := newFat16Table(fatID, readBytes)
+	tbl.size = fatSize
+	fatBytes := make([]byte, readBytes)
 	if _, err := b.ReadAt(fatBytes, int64(fatPrimaryStart)+start); err != nil {
 		return nil, fmt.Errorf("could not read FAT: %w", err)
 	}

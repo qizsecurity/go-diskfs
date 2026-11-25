@@ -79,12 +79,16 @@ func (t *table) equal(a *table) bool {
 }
 
 // tableFromBytes constructs a fat32 table from raw FAT bytes.
-func tableFromBytes(b []byte) *table {
+func tableFromBytes(b []byte) *table { return tableFromBytesOfFAT(b, uint32(len(b))) }
+
+// tableFromBytesOfFAT constructs a fat32 table from the first entries of a FAT of fatSize bytes on disk: b holds
+// the entries read (0 .. CountofClusters+1), fatSize is the size of the whole FAT.
+func tableFromBytesOfFAT(b []byte, fatSize uint32) *table {
 	maxCluster := uint32(len(b) / 4)
 	t := &table{
 		fatID:          binary.LittleEndian.Uint32(b[0:4]),
 		eocMarker:      binary.LittleEndian.Uint32(b[4:8]),
-		size:           uint32(len(b)),
+		size:           fatSize,
 		clusters:       make([]uint32, maxCluster+1),
 		maxCluster:     maxCluster,
 		rootDirCluster: 2,
