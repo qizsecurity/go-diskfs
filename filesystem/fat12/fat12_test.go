@@ -2,6 +2,7 @@ package fat12_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	iofs "io/fs"
@@ -9,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem"
@@ -278,6 +280,63 @@ func TestFat12WriteReadLargeFile(t *testing.T) {
 	f2.Close()
 	if !bytes.Equal(got, content) {
 		t.Errorf("large file content mismatch (len got=%d want=%d)", len(got), len(content))
+	}
+}
+
+func TestFat12ReadStopsAtEndOfFile(t *testing.T) {
+	// A read that starts inside a cluster must stop at the end of the file,
+	// not at the end of the cluster: the bytes after the file in its last
+	// cluster are not part of it.
+	content := []byte("Hello, FAT12!")
+	_, fs := createFAT12(t, "EOFTEST")
+	writeFile(t, fs, "/hello.txt", content)
+
+	f, err := fs.OpenFile("/hello.txt", os.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenFile for read: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(1, io.SeekStart); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	buf := make([]byte, 4096)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("Read: %v", err)
+	}
+	if n != len(content)-1 {
+		t.Errorf("Read from offset 1 returned %d bytes, want the %d left in the file", n, len(content)-1)
+	} else if !bytes.Equal(buf[:n], content[1:]) {
+		t.Errorf("Read from offset 1 returned %q, want %q", buf[:n], content[1:])
+	}
+}
+
+func TestFat12ReadAllReturnsExactSize(t *testing.T) {
+	// io.ReadAll grows its buffer in steps that do not line up with clusters,
+	// so for some sizes its last read starts inside the file's last cluster.
+	// Every size across a few clusters must read back as exactly what was
+	// written.
+	_, fs := createFAT12(t, "SIZES")
+	if err := fs.Mkdir("/sizes"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	for size := 1; size <= 2*512+1; size++ {
+		name := fmt.Sprintf("/sizes/S%04d.BIN", size)
+		content := bytes.Repeat([]byte{'x'}, size)
+		writeFile(t, fs, name, content)
+
+		f, err := fs.OpenFile(name, os.O_RDONLY)
+		if err != nil {
+			t.Fatalf("size %d: OpenFile for read: %v", size, err)
+		}
+		got, err := io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			t.Fatalf("size %d: ReadAll: %v", size, err)
+		}
+		if len(got) != size {
+			t.Errorf("size %d: ReadAll returned %d bytes", size, len(got))
+		}
 	}
 }
 
@@ -626,4 +685,183 @@ func contains(ss []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// TestFat12LossyShortNames creates files whose long names convert lossily to
+// 8.3 and checks that none replaces another and that short names stay unique.
+func TestFat12LossyShortNames(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []string
+	}{
+		{"space then plain", []string{"a b", "ab"}},
+		{"plain then space", []string{"ab", "a b"}},
+		{"truncated extension", []string{"foo.conf", "foo.cons"}},
+		{"kernel versions", []string{"6.1.0-25-amd64", "6.1.0-26-amd64"}},
+		{"upper and lower with space", []string{"A B", "AB", "a b.txt", "ab.txt"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			imgPath, fs := createFAT12(t, "LOSSY")
+			if err := fs.Mkdir("/dir"); err != nil {
+				t.Fatalf("Mkdir: %v", err)
+			}
+			for _, dir := range []string{"/", "/dir/"} {
+				for _, n := range tt.files {
+					writeFile(t, fs, dir+n, []byte("content of "+dir+n))
+				}
+			}
+			fs2 := reopenFAT12(t, imgPath)
+			for _, dir := range []string{"/", "/dir/"} {
+				for _, n := range tt.files {
+					f, err := fs2.OpenFile(dir+n, os.O_RDONLY)
+					if err != nil {
+						t.Fatalf("OpenFile(%q): %v", dir+n, err)
+					}
+					got, _ := io.ReadAll(f)
+					f.Close()
+					if want := "content of " + dir + n; string(got) != want {
+						t.Errorf("%s: content = %q, want %q", dir+n, got, want)
+					}
+				}
+				entries, err := fs2.ReadDir(readDirArg(dir))
+				if err != nil {
+					t.Fatalf("ReadDir(%q): %v", dir, err)
+				}
+				shorts := map[string]bool{}
+				files := 0
+				for _, e := range entries {
+					if e.IsDir() {
+						continue
+					}
+					files++
+					info, err := e.Info()
+					if err != nil {
+						t.Fatalf("Info: %v", err)
+					}
+					fi, ok := info.(fat12.FileInfo)
+					if !ok {
+						t.Fatalf("Info returned %T, want fat12.FileInfo", info)
+					}
+					short := strings.ToUpper(fi.ShortName())
+					if shorts[short] {
+						t.Errorf("%s: short name %q used twice", dir, short)
+					}
+					shorts[short] = true
+				}
+				if files != len(tt.files) {
+					t.Errorf("%s: %d files, want %d", dir, files, len(tt.files))
+				}
+			}
+		})
+	}
+}
+
+// TestFat12CreateDirLossyName checks that a directory is not mistaken for another
+// whose long name differs but whose short name is the same.
+func TestFat12CreateDirLossyName(t *testing.T) {
+	_, fs := createFAT12(t, "LOSSYDIR")
+	for _, d := range []string{"/a b", "/ab"} {
+		if err := fs.Mkdir(d); err != nil {
+			t.Fatalf("Mkdir(%q): %v", d, err)
+		}
+	}
+	writeFile(t, fs, "/a b/one", []byte("1"))
+	writeFile(t, fs, "/ab/two", []byte("2"))
+	for _, d := range []string{"/a b", "/ab"} {
+		entries, err := fs.ReadDir(readDirArg(d))
+		if err != nil || len(entries) != 1 {
+			t.Errorf("ReadDir(%q) = %d entries, %v; want 1", d, len(entries), err)
+		}
+	}
+}
+
+// TestFat12ReopenSameLongName checks that creating a file whose long name matches
+// an existing one still opens that file.
+func TestFat12ReopenSameLongName(t *testing.T) {
+	_, fs := createFAT12(t, "SAMENAME")
+	writeFile(t, fs, "/a b", []byte("first"))
+	f, err := fs.OpenFile("/A B", os.O_CREATE|os.O_RDWR)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	got, _ := io.ReadAll(f)
+	f.Close()
+	if string(got) != "first" {
+		t.Errorf("content = %q, want first", got)
+	}
+	entries, _ := fs.ReadDir(".")
+	if len(entries) != 1 {
+		t.Errorf("%d entries, want 1", len(entries))
+	}
+}
+
+// readDirArg turns "/" or "/dir/" into the form ReadDir accepts.
+func readDirArg(dir string) string {
+	dir = strings.Trim(dir, "/")
+	if dir == "" {
+		return "."
+	}
+	return dir
+}
+
+// ── Backslash separators ──────────────────────────────────────────────────────
+
+func TestFat12BackslashIsASeparator(t *testing.T) {
+	_, fs := createFAT12(t, "BSTEST")
+	ffs, ok := fs.(*fat12.FileSystem)
+	if !ok {
+		t.Fatalf("filesystem is %T, want *fat12.FileSystem", fs)
+	}
+	if err := fs.Mkdir("DEEP/A"); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	writeFile(t, fs, "DEEP/A/B", []byte("deep"))
+
+	// each form names the same entry as DEEP/A/B
+	for _, p := range []string{`DEEP\A\B`, `DEEP\A/B`, `DEEP/A\B`} {
+		if info, err := fs.Stat(p); err != nil || info.Size() != 4 {
+			t.Errorf("Stat(%q) = %v, %v", p, info, err)
+		}
+		if _, err := fs.Open(p); err != nil {
+			t.Errorf("Open(%q): %v", p, err)
+		}
+		if err := fs.Chtimes(p, time.Time{}, time.Time{}, time.Time{}); err != nil {
+			t.Errorf("Chtimes(%q): %v", p, err)
+		}
+		if err := ffs.SetArchiveBit(p, true); err != nil {
+			t.Errorf("SetArchiveBit(%q): %v", p, err)
+		}
+		if _, err := ffs.GetArchiveBit(p); err != nil {
+			t.Errorf("GetArchiveBit(%q): %v", p, err)
+		}
+	}
+	if _, err := fs.ReadDir(`DEEP\..\DEEP`); !errors.Is(err, iofs.ErrInvalid) {
+		t.Errorf("ReadDir(%q) error = %v, want %v", `DEEP\..\DEEP`, err, iofs.ErrInvalid)
+	}
+
+	// a new file goes into DEEP/A, not into the root under a name holding '\'
+	writeFile(t, fs, `DEEP\A\NEW`, []byte("new"))
+	if err := fs.Rename(`DEEP\A\NEW`, `DEEP\A\RN`); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if _, err := fs.Stat("DEEP/A/RN"); err != nil {
+		t.Errorf("Stat after Rename: %v", err)
+	}
+	if err := fs.Remove(`DEEP\A\B`); err != nil {
+		t.Errorf("Remove: %v", err)
+	}
+	var names []string
+	for _, d := range []string{".", "DEEP/A"} {
+		entries, err := fs.ReadDir(d)
+		if err != nil {
+			t.Fatalf("ReadDir(%q): %v", d, err)
+		}
+		for _, e := range entries {
+			names = append(names, d+":"+e.Name())
+		}
+	}
+	if want := []string{".:DEEP", "DEEP/A:RN"}; fmt.Sprint(names) != fmt.Sprint(want) {
+		t.Errorf("entries = %q, want %q", names, want)
+	}
 }

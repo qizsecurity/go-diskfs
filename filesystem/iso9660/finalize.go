@@ -1,6 +1,7 @@
 package iso9660
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"io/fs"
@@ -9,11 +10,13 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/diskfs/go-diskfs/backend"
+	"github.com/diskfs/go-diskfs/util/timestamp"
 	"github.com/diskfs/go-diskfs/version"
 	"github.com/djherbis/times"
 )
@@ -38,6 +41,10 @@ type FinalizeOptions struct {
 	VolumeIdentifier string
 	// PublisherIdentifier custom publisher identifier written to the PVD
 	PublisherIdentifier string
+	// Normalize writes owner 0:0 and modes as xorrisofs -r does: read for
+	// all, no write, execute for all if any execute bit is set, no setuid,
+	// setgid or sticky bit. Directories get nlink 2, files 1.
+	Normalize bool
 }
 
 // finalizeFileInfo is a file info useful for finalization
@@ -95,7 +102,7 @@ type finalizeFileInfo struct {
 	// content in memory content of file. If this is anything other than nil, including a zero-length slice,
 	// then this content is used, rather than anything on disk.
 	content []byte
-	serial  uint64
+	serial  uint32
 }
 
 func finalizeFileInfoFromFile(p, fullPath string, fi fs.FileInfo) (*finalizeFileInfo, error) {
@@ -218,10 +225,9 @@ func (fi *finalizeFileInfo) toDirectoryEntry(fsm *FileSystem, isSelf, isParent b
 		// add appropriate PX, TF, SL, NM extensions
 		for _, e := range fsm.suspExtensions {
 			var (
-				ext []directoryEntrySystemUseExtension
 				err error
 			)
-			ext, err = e.GetFileExtensions(fi, isSelf, isParent)
+			ext, err := e.GetFileExtensions(fi, isSelf, isParent)
 			if err != nil {
 				return nil, fmt.Errorf("error getting extensions for %s at path %s: %v", e.ID(), fi.path, err)
 			}
@@ -389,7 +395,14 @@ func (fi *finalizeFileInfo) toJolietDirectory(fsm *FileSystem, jolietLocation, p
 	parent.location = parentJolietLocation
 
 	entries := []*directoryEntry{self, parent}
-	for _, child := range fi.children {
+	// Joliet identifiers use the original names, which can sort differently
+	// from the shortened ISO 9660 identifiers in fi.children. Compare the
+	// bytes that are written, since UCS-2 order differs from string order.
+	children := append([]*finalizeFileInfo(nil), fi.children...)
+	sort.Slice(children, func(i, j int) bool {
+		return bytes.Compare(ucs2StringToBytes(jolietFilename(children[i])), ucs2StringToBytes(jolietFilename(children[j]))) < 0
+	})
+	for _, child := range children {
 		de := child.toJolietDirectoryEntry(fsm, false, false)
 		entries = append(entries, de)
 	}
@@ -578,6 +591,32 @@ func (fsm *FileSystem) Finalize(options FinalizeOptions) error {
 	if err != nil {
 		return fmt.Errorf("error walking tree: %v", err)
 	}
+	if os.Getenv("SOURCE_DATE_EPOCH") != "" {
+		t := timestamp.GetTime()
+		for _, e := range fileList {
+			e.modTime, e.accessTime, e.changeTime = t, t, t
+		}
+		for _, e := range dirList {
+			e.modTime, e.accessTime, e.changeTime = t, t, t
+		}
+	}
+	if options.Normalize {
+		all := append([]*finalizeFileInfo{}, fileList...)
+		for _, d := range dirList {
+			all = append(all, d)
+		}
+		for _, e := range all {
+			e.uid, e.gid, e.nlink = 0, 0, 1
+			if e.isDir {
+				e.nlink = 2
+			}
+			perm := os.FileMode(0o444)
+			if e.mode&0o111 != 0 {
+				perm |= 0o111
+			}
+			e.mode = e.mode&^(os.ModePerm|os.ModeSetuid|os.ModeSetgid|os.ModeSticky) | perm
+		}
+	}
 
 	// starting point
 	root := dirList["."]
@@ -654,7 +693,7 @@ func (fsm *FileSystem) Finalize(options FinalizeOptions) error {
 		shortname, extension := calculateShortnameExtension(path.Base(catname))
 		// break down the catalog basename from the parent dir
 		catSize := int64(len(bootcat))
-		now := time.Now()
+		now := timestamp.GetTime()
 		catEntry = &finalizeFileInfo{
 			content:    bootcat,
 			size:       catSize,
@@ -667,23 +706,58 @@ func (fsm *FileSystem) Finalize(options FinalizeOptions) error {
 			accessTime: now,
 			changeTime: now,
 		}
-		// make it the first file
-		files = append([]*finalizeFileInfo{catEntry}, files...)
-
-		// if we were not told to hide the catalog, add it to its parent
-		if !options.ElTorito.HideBootCatalog {
-			var parent *finalizeFileInfo
-			parent, err = root.findEntry(path.Dir(catname))
-			if err != nil {
-				return fmt.Errorf("error finding parent for boot catalog %s: %v", catname, err)
+		parent, err := root.findEntry(path.Dir(catname))
+		if err != nil {
+			return fmt.Errorf("error finding parent for boot catalog %s: %v", catname, err)
+		}
+		if parent == nil && !options.ElTorito.HideBootCatalog {
+			return fmt.Errorf("unable to find parent directory for boot catalog %s", catname)
+		}
+		var existing *finalizeFileInfo
+		if parent != nil {
+			for _, child := range parent.children {
+				if child.name == catEntry.name {
+					existing = child
+					break
+				}
 			}
-			parent.addChild(catEntry)
+		}
+		// trueChild marks the placeholder of a relocated directory
+		if existing != nil && (existing.IsDir() || existing.trueChild != nil || existing.mode&os.ModeSymlink != 0) {
+			if !options.ElTorito.HideBootCatalog {
+				return fmt.Errorf("boot catalog %s collides with a directory or symlink", catname)
+			}
+			// a hidden catalog has no directory record, so nothing collides
+			existing = nil
+		}
+		if existing != nil {
+			if options.ElTorito.HideBootCatalog {
+				parent.children = slices.DeleteFunc(parent.children, func(child *finalizeFileInfo) bool { return child == existing })
+				files = slices.DeleteFunc(files, func(file *finalizeFileInfo) bool { return file == existing })
+			} else {
+				catEntry = existing
+			}
+		}
+		catEntry.content = bootcat
+		catEntry.size = catSize
+		catEntry.blocks = calculateBlocks(catSize, fsm.blocksize)
+		if existing == nil || options.ElTorito.HideBootCatalog {
+			files = append([]*finalizeFileInfo{catEntry}, files...)
+			if !options.ElTorito.HideBootCatalog {
+				if err := giveUniqueIdentifier(catEntry, parent.children); err != nil {
+					return fmt.Errorf("unable to name boot catalog %s: %w", catname, err)
+				}
+				parent.addChild(catEntry)
+			}
 		}
 		for _, e := range options.ElTorito.Entries {
 			var parent, child *finalizeFileInfo
 			parent, err = root.findEntry(path.Dir(e.BootFile))
 			if err != nil {
 				return fmt.Errorf("error finding parent for boot image file %s: %v", e.BootFile, err)
+			}
+			if parent == nil {
+				return fmt.Errorf("unable to find parent directory for boot image file %s", e.BootFile)
 			}
 			// did we ask to hide any image files?
 			if e.HideBootFile {
@@ -697,10 +771,20 @@ func (fsm *FileSystem) Finalize(options FinalizeOptions) error {
 			if child == nil {
 				return fmt.Errorf("unable to find image child %s: %v", e.BootFile, err)
 			}
+			if child == catEntry {
+				return fmt.Errorf("boot image file %s is also the boot catalog", e.BootFile)
+			}
 			// save the child so we can add location late
 			e.size = uint32(child.size)
 			child.elToritoEntry = e
 		}
+	}
+	// Directory records must be ordered by their ISO 9660 file identifiers.
+	// Do this before calculating directory sizes, since record order affects padding.
+	for _, dir := range dirs {
+		sort.Slice(dir.children, func(i, j int) bool {
+			return lessISOIdentifier(dir.children[i], dir.children[j])
+		})
 	}
 
 	var size, ceBlocks int
@@ -966,7 +1050,7 @@ func (fsm *FileSystem) Finalize(options FinalizeOptions) error {
 	totalSize := location
 	location = dataStartSector
 	// create and write the primary volume descriptor, supplementary and boot, and volume descriptor set terminator
-	now := time.Now()
+	now := timestamp.GetTime()
 	rootDE, err := root.toDirectoryEntry(fsm, true, false)
 	if err != nil {
 		return fmt.Errorf("could not convert root entry for primary volume descriptor to dirEntry: %v", err)
@@ -1123,7 +1207,7 @@ func createPathTable(fi []*finalizeFileInfo) *pathTable {
 	})
 	indexMap := make(map[*finalizeFileInfo]int)
 	// now that it is sorted, create the ordered path table entries
-	entries := make([]*pathTableEntry, 0)
+	entries := make([]*pathTableEntry, 0, len(fis))
 	for i, e := range fis {
 		name := e.Name()
 		nameSize := len(name)
@@ -1214,7 +1298,7 @@ func walkTree(workspace string) ([]*finalizeFileInfo, map[string]*finalizeFileIn
 		fileList        = make([]*finalizeFileInfo, 0)
 		collisionGroups = make(map[string]*collisionGroup)
 		entry           *finalizeFileInfo
-		serial          uint64
+		serial          uint32
 	)
 	err := filepath.WalkDir(workspace, func(actualPath string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -1372,6 +1456,52 @@ func resolveCollisionGroup(group *collisionGroup) error {
 		name += "." + group.extension
 	}
 	return fmt.Errorf("too many filename collisions for: %s", name)
+}
+
+// lessISOIdentifier follows ECMA-119's directory order: file name first,
+// then extension. Comparing the whole identifier puts A.1;1 before A.;1.
+func lessISOIdentifier(a, b *finalizeFileInfo) bool {
+	if a.shortname != b.shortname {
+		return a.shortname < b.shortname
+	}
+	if a.extension != b.extension {
+		return a.extension < b.extension
+	}
+	// The name and the extension can be equal for two different identifiers:
+	// a directory FOO and a file FOO.;1, which has no extension.
+	// walkTree prevents this pair in a source directory. But Rock Ridge
+	// relocation moves a deep directory into the root and does no such check.
+	// ECMA-119 does not give an order for this pair. The directory goes
+	// first, as xorriso and genisoimage write it.
+	return a.Name() < b.Name()
+}
+
+// giveUniqueIdentifier keeps an unrelated source file intact when the
+// generated catalog's ISO 9660 identifier would otherwise collide with it.
+func giveUniqueIdentifier(entry *finalizeFileInfo, siblings []*finalizeFileInfo) error {
+	used := make(map[string]bool, len(siblings))
+	for _, sibling := range siblings {
+		used[sibling.Name()] = true
+	}
+	if !used[entry.Name()] {
+		return nil
+	}
+	base := entry.shortname
+	limit := 1
+	for digits := 1; digits < 8; digits++ {
+		limit *= 10
+		prefix := base
+		if len(prefix) > 8-digits {
+			prefix = prefix[:8-digits]
+		}
+		for n := 0; n < limit; n++ {
+			entry.shortname = fmt.Sprintf("%s%0*d", prefix, digits, n)
+			if !used[entry.Name()] {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("too many ISO 9660 identifier collisions for %s", entry.name)
 }
 
 func calculateBlocks(size, blocksize int64) uint32 {

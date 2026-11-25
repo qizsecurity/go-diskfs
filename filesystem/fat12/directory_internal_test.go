@@ -5,6 +5,7 @@ package fat12
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -191,6 +192,164 @@ func TestCreateEntryNoCollisionWhenStemFits(t *testing.T) {
 	}
 	if e.fileExtension != "TXT" {
 		t.Errorf("extension = %q, want TXT", e.fileExtension)
+	}
+}
+
+// TestCreateEntryDotLeadingName checks the 8.3 names generated for names that
+// begin with a dot. A name with no further dot has no stem at all and takes one
+// derived from the rest of the name, matching what mtools and the Linux kernel
+// generate. A name with a later dot keeps its stem, so it needs no numeric tail;
+// mtools adds one there regardless, which is a difference in policy rather than
+// a name any FAT implementation would reject.
+func TestCreateEntryDotLeadingName(t *testing.T) {
+	tests := []struct {
+		name      string
+		shortName string
+		extension string
+	}{
+		{".boot_repository", "BOOT_R~1", ""},
+		{".DS_Store", "DS_STO~1", ""},
+		{".a", "A~1", ""},
+		{".abc", "ABC~1", ""},
+		{".config.txt", "CONFIG", "TXT"},
+		{".tar.gz", "TAR", "GZ"},
+	}
+	for _, tt := range tests {
+		d := &Directory{}
+		e, err := d.createEntry(tt.name, 2, false)
+		if err != nil {
+			t.Fatalf("createEntry %s: %v", tt.name, err)
+		}
+		if e.filenameShort != tt.shortName || e.fileExtension != tt.extension {
+			t.Errorf("createEntry(%q): short name = %q.%q, want %q.%q",
+				tt.name, e.filenameShort, e.fileExtension, tt.shortName, tt.extension)
+		}
+		if e.filenameLong != tt.name {
+			t.Errorf("createEntry(%q): long name = %q", tt.name, e.filenameLong)
+		}
+	}
+}
+
+func TestCreateEntryDotLeadingNameCollision(t *testing.T) {
+	d := &Directory{}
+	first, err := d.createEntry(".boot_repository", 2, false)
+	if err != nil {
+		t.Fatalf("createEntry first: %v", err)
+	}
+	second, err := d.createEntry(".boot_repository2", 3, false)
+	if err != nil {
+		t.Fatalf("createEntry second: %v", err)
+	}
+	if first.filenameShort != "BOOT_R~1" {
+		t.Errorf("first entry: short name = %q, want BOOT_R~1", first.filenameShort)
+	}
+	if second.filenameShort != "BOOT_R~2" {
+		t.Errorf("second entry: short name = %q, want BOOT_R~2", second.filenameShort)
+	}
+}
+
+// TestCreateEntryShortNames covers the short name given to a new entry, both
+// when the name converts to 8.3 losslessly and when the conversion is lossy but
+// still fits in 8.3.
+func TestCreateEntryShortNames(t *testing.T) {
+	tests := []struct {
+		name     string
+		existing []string // created first, in order
+		create   string
+		short    string
+		ext      string
+	}{
+		// Plain names that convert losslessly keep their short name.
+		{"plain 8.3", nil, "FOO.TXT", "FOO", "TXT"},
+		{"lower case only", nil, "foo.txt", "FOO", "TXT"},
+		{"mixed case only", nil, "FooBar.Txt", "FOOBAR", "TXT"},
+		{"no extension", nil, "README", "README", ""},
+		{"8.3 distinct from neighbours", []string{"foo.bar"}, "foo.txt", "FOO", "TXT"},
+		// Lossy conversions that still fit get a numeric tail.
+		{"space removed", nil, "a b", "AB~1", ""},
+		{"invalid character replaced", nil, "a+b.txt", "A_B~1", "TXT"},
+		{"extension truncated", nil, "foo.conf", "FOO~1", "CON"},
+		{"dots in stem", nil, "6.1.0-25-amd64", "61~1", "0-2"},
+		{"dots in stem short", nil, "a.b.c", "AB~1", "C"},
+		// Plain short name already taken.
+		{"space name then plain", []string{"a b"}, "ab", "AB", ""},
+		{"plain then space name", []string{"ab"}, "a b", "AB~1", ""},
+		{"truncated extension twice", []string{"foo.conf"}, "foo.cons", "FOO~2", "CON"},
+		{"lossy name, plain one taken", []string{"foo.txt"}, "Foo .txt", "FOO~1", "TXT"},
+		{"kernel versions", []string{"6.1.0-25-amd64"}, "6.1.0-26-amd64", "61~2", "0-2"},
+		// Long stems keep working as before.
+		{"long stem first", nil, "LongFileNameA.txt", "LONGFI~1", "TXT"},
+		{"long stem second", []string{"LongFileNameA.txt"}, "LongFileNameB.txt", "LONGFI~2", "TXT"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &Directory{}
+			for i, n := range tt.existing {
+				if _, err := d.createEntry(n, uint32(i+2), false); err != nil {
+					t.Fatalf("createEntry(%q): %v", n, err)
+				}
+			}
+			e, err := d.createEntry(tt.create, 99, false)
+			if err != nil {
+				t.Fatalf("createEntry(%q): %v", tt.create, err)
+			}
+			if e.filenameShort != tt.short || e.fileExtension != tt.ext {
+				t.Errorf("short name = %q.%q, want %q.%q", e.filenameShort, e.fileExtension, tt.short, tt.ext)
+			}
+			if e.filenameLong != tt.create && e.filenameLong != "" {
+				t.Errorf("long name = %q, want %q or none", e.filenameLong, tt.create)
+			}
+			seen := map[string]bool{}
+			for _, o := range d.entries {
+				k := o.filenameShort + "." + o.fileExtension
+				if seen[k] {
+					t.Errorf("short name %q is used twice in the directory", k)
+				}
+				seen[k] = true
+			}
+		})
+	}
+}
+
+// TestCreateEntryTailOverflow checks that the numeric tail grows past ~9 when
+// many names share a basis name.
+func TestCreateEntryTailOverflow(t *testing.T) {
+	// Twelve names with the same basis stem, to run into the two-digit tail.
+	d := &Directory{}
+	for i := range 12 {
+		name := "x" + strings.Repeat(" ", i+1) + "y.txt"
+		if _, err := d.createEntry(name, uint32(i+2), false); err != nil {
+			t.Fatalf("createEntry(%q): %v", name, err)
+		}
+	}
+	last := d.entries[11]
+	if last.filenameShort != "XY~12" {
+		t.Errorf("twelfth short name = %q, want XY~12", last.filenameShort)
+	}
+}
+
+// TestRenameEntryLossyShortName checks that a rename to a name whose plain
+// short name is taken by another entry gets a unique short name.
+func TestRenameEntryLossyShortName(t *testing.T) {
+	d := &Directory{}
+	if _, err := d.createEntry("foo.conf", 2, false); err != nil {
+		t.Fatalf("createEntry: %v", err)
+	}
+	if _, err := d.createEntry("other.txt", 3, false); err != nil {
+		t.Fatalf("createEntry: %v", err)
+	}
+	if err := d.renameEntry("other.txt", "foo.cons"); err != nil {
+		t.Fatalf("renameEntry: %v", err)
+	}
+	if len(d.entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(d.entries))
+	}
+	a, b := d.entries[0], d.entries[1]
+	if a.filenameShort == b.filenameShort && a.fileExtension == b.fileExtension {
+		t.Errorf("both entries have short name %q.%q", a.filenameShort, a.fileExtension)
+	}
+	if b.filenameLong != "foo.cons" || b.clusterLocation != 3 {
+		t.Errorf("renamed entry = %q (cluster %d)", b.filenameLong, b.clusterLocation)
 	}
 }
 

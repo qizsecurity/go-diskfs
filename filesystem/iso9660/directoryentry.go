@@ -577,7 +577,7 @@ func (de *directoryEntry) statT() *StatT {
 			s.UID = e.uid
 			s.GID = e.gid
 			s.NLink = e.linkCount
-			s.Inode = uint32(e.serial)
+			s.Inode = e.serial
 		case rockRidgeSymlink:
 			s.RockRidge = true
 			if !e.continued {
@@ -597,7 +597,7 @@ func (de *directoryEntry) Info() (os.FileInfo, error) {
 
 // Type returns the type of the directory entry
 func (de *directoryEntry) Type() os.FileMode {
-	return de.Mode()
+	return de.Mode().Type()
 }
 
 // utilities

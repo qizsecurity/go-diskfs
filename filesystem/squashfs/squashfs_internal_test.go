@@ -3,9 +3,11 @@ package squashfs
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
@@ -239,6 +241,7 @@ func TestReadBlock(t *testing.T) {
 	location := int64(10000)
 	smallLocation := int64(2000)
 	size := uint32(20)
+	//nolint:prealloc // just a test, do not care
 	data := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}
 	testFile := &testhelper.FileImpl{
 		Reader: func(b []byte, offset int64) (int, error) {
@@ -276,11 +279,7 @@ func TestReadBlock(t *testing.T) {
 		fs := &FileSystem{
 			backend:    file.New(testFile, true),
 			compressor: tt.compressor,
-			// readBlock now passes fs.superblock.blocksize as decompress's
-			// maxOut (needed for CompressorLz4's raw-block decode, which
-			// carries no embedded output-length header); a real FileSystem
-			// always has a superblock by the time readBlock runs.
-			superblock: &superblock{blocksize: testValidBlocksize},
+			blocksize:  minBlocksize,
 		}
 		b, err := fs.readBlock(tt.location, tt.compressed, size)
 		switch {
@@ -330,17 +329,19 @@ func TestReadFragment(t *testing.T) {
 		{2, 2, 5, nil, nil, fmt.Errorf("fragment compressed but do not have valid compressor")},
 		{2, 2, 9, &testCompressorAddBytes{b: []byte{0x40}}, append(data[32:40], 0x40), nil},
 		{2, 2, 5, &testCompressorAddBytes{err: fmt.Errorf("foo")}, nil, fmt.Errorf("decompress error: foo")},
-		{3, 2, 5, nil, nil, fmt.Errorf("cannot find fragment block with index %d", 3)},
+		{4, 2, 5, nil, nil, fmt.Errorf("cannot find fragment block with index %d", 4)},
+		{1, 8, 5, nil, nil, fmt.Errorf("fragment of 5 bytes at offset 8 is outside fragment block 1 of 10 bytes")},
+		{2, 2, 5, &testCompressorAddBytes{b: make([]byte, minBlocksize)}, nil, fmt.Errorf("decompress error: %w", ErrDecompressedTooLarge)},
+		{3, 0, 5, nil, nil, fmt.Errorf("fragment block 3 is %d bytes, more than the block size %d", minBlocksize+1, minBlocksize)},
 	}
 
 	for i, tt := range tests {
 		fs := &FileSystem{
-			fragments:  fragments,
+			fragments: append(fragments[:len(fragments):len(fragments)],
+				&fragmentEntry{start: 0, size: uint32(minBlocksize) + 1, compressed: false}),
 			backend:    file.New(testFile, true),
 			compressor: tt.compressor,
-			// readFragment now passes fs.superblock.blocksize as decompress's
-			// maxOut -- see the matching comment in TestReadBlock.
-			superblock: &superblock{blocksize: testValidBlocksize},
+			blocksize:  minBlocksize,
 		}
 		b, err := fs.readFragment(tt.index, tt.offset, tt.size)
 		switch {
@@ -348,6 +349,8 @@ func TestReadFragment(t *testing.T) {
 			t.Errorf("%d: mismatched error, actual then expected", i)
 			t.Logf("%v", err)
 			t.Logf("%v", tt.err)
+		case errors.Unwrap(tt.err) != nil && !errors.Is(err, errors.Unwrap(tt.err)):
+			t.Errorf("%d: error does not wrap %v: %v", i, errors.Unwrap(tt.err), err)
 		case !bytes.Equal(b, tt.data):
 			t.Errorf("%d: Mismatched data, actual then expected", i)
 			t.Logf("% x", b)
@@ -401,5 +404,39 @@ func TestReadUidsGids(t *testing.T) {
 		t.Errorf("Mismatched results, actual then expected")
 		t.Logf("%#v", uidsgids)
 		t.Logf("%#v", expected)
+	}
+}
+
+// TestReadInvalidBlocksize checks that Read refuses an image whose superblock declares a block size mksquashfs would
+// not: every block, and every sparse block allocation, is bounded by it.
+func TestReadInvalidBlocksize(t *testing.T) {
+	image, err := os.ReadFile(Squashfsfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, blocksize := range []uint32{0, 1 << 11, 1 << 21, 1 << 31} {
+		// the block log parseSuperblock expects, so that only the block size check can refuse the image: for 0, what
+		// uint16(-Inf) converts to on this platform
+		blocklog := uint16(math.Log2(float64(blocksize)))
+		patched := bytes.Clone(image)
+		binary.LittleEndian.PutUint32(patched[12:16], blocksize)
+		binary.LittleEndian.PutUint16(patched[22:24], blocklog)
+
+		t.Run(fmt.Sprintf("blocksize %d", blocksize), func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "image_*.sqs")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			if _, err := f.Write(patched); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = Read(file.New(f, true), int64(len(patched)), 0, 0)
+			if err == nil || !strings.Contains(err.Error(), "invalid superblock") {
+				t.Errorf("expected an invalid superblock error, got %v", err)
+			}
+		})
 	}
 }

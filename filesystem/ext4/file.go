@@ -1,6 +1,7 @@
 package ext4
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -35,90 +36,92 @@ func (fl *File) Read(b []byte) (int, error) {
 	if fl.fileType == dirFileTypeDirectory {
 		return 0, fmt.Errorf("cannot read directory")
 	}
-	var (
-		fileSize  = int64(fl.size)
-		blocksize = uint64(fl.filesystem.superblock.blockSize)
-	)
+	if fl.offset < 0 || fl.size > math.MaxInt64 {
+		return 0, fmt.Errorf("invalid ext4 file size or offset")
+	}
+	fileSize := int64(fl.size)
 	if fl.offset >= fileSize {
 		return 0, io.EOF
 	}
-
-	// Calculate the number of bytes to read
-	bytesToRead := int64(len(b))
-	if fl.offset+bytesToRead > fileSize {
-		bytesToRead = fileSize - fl.offset
+	if len(b) == 0 {
+		return 0, nil
 	}
-
 	// a file with inline data is in memory
 	if fl.flags != nil && fl.flags.inlineData {
-		n := copy(b[:bytesToRead], fl.inline[fl.offset:])
+		want := min(int64(len(b)), fileSize-fl.offset)
+		n := copy(b[:want], fl.inline[fl.offset:])
 		fl.offset += int64(n)
 		if fl.offset >= fileSize {
 			return n, io.EOF
 		}
 		return n, nil
 	}
-
-	// Create a buffer to hold the bytes to be read
-	readBytes := int64(0)
-	b = b[:bytesToRead]
-
-	// Walk the file position by position. At each position the file has either an extent that covers it, or a hole.
-	// A written extent is read from the disk. An unwritten extent and a hole read as zeros
-	// (kernel fs/ext4/extents.c ext4_ext_map_blocks, ext4_ext_handle_unwritten_extents).
-	// Every step advances fl.offset by at least one byte, so Read never returns 0 bytes with a nil error before EOF.
-	for readBytes < bytesToRead {
-		blk := uint64(fl.offset) / blocksize
-		var (
-			covering  *extent
-			nextStart = uint64(math.MaxUint64) // first file block after blk that has an extent
-		)
-		for i := range fl.extents {
-			e := &fl.extents[i]
-			if uint64(e.fileBlock) <= blk && blk < uint64(e.fileBlock)+uint64(e.count) {
-				covering = e
-				break
-			}
-			if uint64(e.fileBlock) > blk && uint64(e.fileBlock) < nextStart {
-				nextStart = uint64(e.fileBlock)
-			}
+	blockSize := int64(fl.filesystem.superblock.blockSize)
+	if blockSize < 1024 || blockSize > 65536 || blockSize&(blockSize-1) != 0 {
+		return 0, fmt.Errorf("invalid ext4 block size")
+	}
+	var previousEnd int64
+	for _, extent := range fl.extents {
+		count := int64(extent.count)
+		if count > 32768 {
+			count -= 32768
 		}
-		// the bytes left to read in the extent or in the hole
-		var leftHere int64
-		if covering != nil {
-			leftHere = (int64(covering.fileBlock)+int64(covering.count))*int64(blocksize) - fl.offset
-		} else if nextStart != math.MaxUint64 {
-			leftHere = int64(nextStart*blocksize) - fl.offset
-		} else {
-			leftHere = bytesToRead - readBytes
+		start := int64(extent.fileBlock) * blockSize
+		end := start + count*blockSize
+		if count == 0 || start < previousEnd {
+			return 0, fmt.Errorf("invalid ext4 extent order or length")
 		}
-		toReadHere := min(bytesToRead-readBytes, leftHere)
-		dst := b[readBytes : readBytes+toReadHere]
-		if covering == nil || covering.unwritten {
-			clear(dst)
-			readBytes += toReadHere
-			fl.offset += toReadHere
+		if extent.count <= 32768 && (extent.startingBlock > uint64(math.MaxInt64)/uint64(blockSize) ||
+			int64(extent.startingBlock)*blockSize > math.MaxInt64-count*blockSize) {
+			return 0, fmt.Errorf("ext4 extent address overflows")
+		}
+		previousEnd = end
+	}
+	want := int64(len(b))
+	if want > fileSize-fl.offset {
+		want = fileSize - fl.offset
+	}
+	start, end := fl.offset, fl.offset+want
+	clear(b[:want])
+	for _, extent := range fl.extents {
+		count := int64(extent.count)
+		unwritten := count > 32768
+		if unwritten {
+			count -= 32768
+		}
+		extentStart := int64(extent.fileBlock) * blockSize
+		extentEnd := extentStart + count*blockSize
+		if extentStart >= end {
+			// extents are validated to be sorted, so nothing further can overlap the window
+			break
+		}
+		overlapStart, overlapEnd := max(start, extentStart), min(end, extentEnd)
+		if overlapStart >= overlapEnd || unwritten {
 			continue
 		}
-		// read those bytes from the disk
-		startPosOnDisk := covering.startingBlock*blocksize + uint64(fl.offset-int64(covering.fileBlock)*int64(blocksize))
-		read, err := fl.filesystem.backend.ReadAt(dst, int64(startPosOnDisk))
+		destination := b[overlapStart-start : overlapEnd-start]
+		physicalOffset := int64(extent.startingBlock)*blockSize + overlapStart - extentStart
+		n, err := fl.filesystem.backend.ReadAt(destination, physicalOffset)
+		if n < 0 || n > len(destination) {
+			fl.offset = overlapStart
+			return int(overlapStart - start), errors.Join(fmt.Errorf("ext4 backend returned invalid read count"), err)
+		}
+		if n != len(destination) {
+			err = errors.Join(io.ErrUnexpectedEOF, err)
+		} else if err == io.EOF {
+			// io.ReaderAt may report io.EOF together with a complete read at the end of the backend
+			err = nil
+		}
 		if err != nil {
-			return int(readBytes), fmt.Errorf("failed to read bytes: %v", err)
+			fl.offset = overlapStart + int64(n)
+			return int(fl.offset - start), fmt.Errorf("failed to read extent bytes: %w", err)
 		}
-		if read == 0 {
-			// ReadAt must return an error for a short read; do not loop if a backend does not
-			return int(readBytes), fmt.Errorf("failed to read bytes: %w", io.ErrUnexpectedEOF)
-		}
-		readBytes += int64(read)
-		fl.offset += int64(read)
 	}
-	var err error
-	if fl.offset >= fileSize {
-		err = io.EOF
+	fl.offset = end
+	if end == fileSize {
+		return int(want), io.EOF
 	}
-
-	return int(readBytes), err
+	return int(want), nil
 }
 
 // Write writes len(b) bytes to the File.
@@ -210,13 +213,20 @@ func (fl *File) Write(b []byte) (int, error) {
 
 	for _, e := range fl.extents {
 		// if the last block of the extent is before the first block we want to write, skip it
-		if uint64(e.fileBlock)+uint64(e.count) < writeStartBlock {
+		// notice: need equal sign
+		if uint64(e.fileBlock)+uint64(e.count) <= writeStartBlock {
 			continue
 		}
 		// extentSize is the number of bytes on the disk for the extent
 		extentSize := int64(e.count) * int64(blocksize)
 		// where do we start and end in the extent?
 		startPositionInExtent := fl.offset - int64(e.fileBlock)*int64(blocksize)
+
+		// Protect
+		if startPositionInExtent < 0 || startPositionInExtent > extentSize {
+			return int(writtenBytes), fmt.Errorf("write offset %d falls outside extent (fileBlock %d, count %d) of file %s", fl.offset, e.fileBlock, e.count, fl.filename)
+		}
+
 		leftInExtent := extentSize - startPositionInExtent
 		// how many bytes are left in the extent?
 		toWriteInOffset := bytesToWrite - writtenBytes

@@ -273,7 +273,7 @@ type rockRidgePosixAttributes struct {
 	linkCount uint32
 	uid       uint32
 	gid       uint32
-	serial    uint64
+	serial    uint32
 }
 
 func (d rockRidgePosixAttributes) Equal(o directoryEntrySystemUseExtension) bool {
@@ -346,16 +346,18 @@ func (d rockRidgePosixAttributes) Data() []byte {
 	binary.LittleEndian.PutUint32(ret[24:28], d.gid)
 	binary.BigEndian.PutUint32(ret[28:32], d.gid)
 	if d.length == 44 {
-		binary.LittleEndian.PutUint64(ret[32:40], d.serial)
+		binary.LittleEndian.PutUint32(ret[32:36], d.serial)
+		binary.BigEndian.PutUint32(ret[36:40], d.serial)
 	}
 	return ret
 }
 func (d rockRidgePosixAttributes) Bytes() []byte {
-	ret := make([]byte, 4)
+	data := d.Data()
+	ret := make([]byte, 4, 4+len(data))
 	copy(ret[0:2], rockRidgeSignaturePosixAttributes)
 	ret[2] = uint8(d.Length())
 	ret[3] = d.Version()
-	ret = append(ret, d.Data()...)
+	ret = append(ret, data...)
 	return ret
 }
 func (d rockRidgePosixAttributes) Continuable() bool {
@@ -414,9 +416,9 @@ func (r *rockRidgeExtension) parsePosixAttributes(b []byte) (directoryEntrySyste
 		m |= uint32(os.ModeNamedPipe)
 	}
 
-	var serial uint64
+	var serial uint32
 	if len(b) == 44 {
-		serial = binary.LittleEndian.Uint64(b[36:44])
+		serial = binary.LittleEndian.Uint32(b[36:40])
 	}
 	return rockRidgePosixAttributes{
 		mode:      os.FileMode(m),
@@ -457,11 +459,12 @@ func (d rockRidgePosixDeviceNumber) Data() []byte {
 	return ret
 }
 func (d rockRidgePosixDeviceNumber) Bytes() []byte {
-	ret := make([]byte, 4)
+	data := d.Data()
+	ret := make([]byte, 4, 4+len(data))
 	copy(ret[0:2], rockRidgeSignaturePosixDeviceNumber)
 	ret[2] = uint8(d.Length())
 	ret[3] = d.Version()
-	ret = append(ret, d.Data()...)
+	ret = append(ret, data...)
 	return ret
 }
 func (d rockRidgePosixDeviceNumber) Continuable() bool {
@@ -682,7 +685,7 @@ func (d rockRidgeName) Bytes() []byte {
 	}
 	b := make([]byte, 0)
 	for i := 0; i < count; i++ {
-		b2 := make([]byte, 5)
+		b2 := make([]byte, 5, 5+len(nameBytes))
 		copy(b2[0:2], rockRidgeSignatureName)
 		// we set size and continuing flag when we are done with this entry
 		b2[3] = d.Version()
