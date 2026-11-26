@@ -54,9 +54,15 @@ func (fl *File) Read(b []byte) (int, error) {
 	}
 
 	// just read the requested number of bytes and change our offset
-	_, err := file.ReadAt(b[0:maxRead], int64(location)*fs.blocksize+fl.offset)
+	n, err := file.ReadAt(b[0:maxRead], int64(location)*fs.blocksize+fl.offset)
 	if err != nil && err != io.EOF {
 		return 0, err
+	}
+	if n < maxRead {
+		// the backend ended before the bytes the record states: only the n bytes it gave are the file's, and the rest of
+		// b is not (it holds what the caller had there)
+		fl.offset += int64(n)
+		return n, io.ErrUnexpectedEOF
 	}
 
 	fl.offset += int64(maxRead)
