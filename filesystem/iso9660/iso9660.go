@@ -495,6 +495,9 @@ func (fsm *FileSystem) Open(p string) (iofs.File, error) {
 				return &dirFile{entry: e, fs: fsm, path: p}, nil
 			}
 			// regular file
+			if err := fsm.checkFileExtent(p, e.location, e.size); err != nil {
+				return nil, &iofs.PathError{Op: "open", Path: p, Err: err}
+			}
 			return &File{
 				directoryEntry: e,
 				isReadWrite:    false,
@@ -558,6 +561,9 @@ func (fsm *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 		// if the file does not exist, and is not opened for os.O_CREATE, return an error
 		if targetEntry == nil {
 			return nil, fmt.Errorf("target file %s does not exist", p)
+		}
+		if err := fsm.checkFileExtent(p, targetEntry.location, targetEntry.size); err != nil {
+			return nil, err
 		}
 		// now open the file
 		f = &File{

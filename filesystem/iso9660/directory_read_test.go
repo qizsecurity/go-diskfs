@@ -12,9 +12,11 @@ package iso9660_test
 // changed in its own record (BP 11 to 18, both-byte orders, 7.3.3).
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -280,4 +282,101 @@ func TestPathTableOfSeveralBlocksIsReadThroughTheWindow(t *testing.T) {
 			t.Errorf("ReadDir(DIR%05d): %v", i, err)
 		}
 	}
+}
+
+// firstFileRecord returns the offset in b of the first File record (File Flags BP 26 bit 1 clear, 9.1.6) of the root
+// directory's extent, and its name.
+func firstFileRecord(t *testing.T, b []byte, root int64) (int64, string) {
+	t.Helper()
+	ext := b[root*hostileDirBlock : (root+1)*hostileDirBlock]
+	for off := 0; off < len(ext) && ext[off] != 0; off += int(ext[off]) {
+		rec := ext[off : off+int(ext[off])]
+		id := rec[33 : 33+int(rec[32])]
+		if rec[25]&2 == 0 && binary.LittleEndian.Uint32(rec[10:]) > 0 {
+			return root*hostileDirBlock + int64(off), string(id)
+		}
+	}
+	t.Fatal("no file record in the root extent of 9660.iso")
+	return 0, ""
+}
+
+// A file record states a data length of 2,147,483,647 (BP 11 to 18): OpenFile refuses it with the typed error. Before, the
+// reader gave the caller 2 GiB of bytes the volume does not hold (the read past the end of the file was not an error).
+func TestHostileFileExtentPastVolumeIsRefused(t *testing.T) {
+	b, root := hostileISO(t)
+	off, name := firstFileRecord(t, b, root)
+	setRecordSize(b, off, 0x7FFFFFFF)
+	fs := openISO(t, b)
+	// the name in the root listing is the identifier without ";1" as the reader gives it
+	var target string
+	des, err := fs.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, de := range des {
+		if !de.IsDir() && len(name) >= len(de.Name()) && name[:len(de.Name())] == de.Name() {
+			target = de.Name()
+			break
+		}
+	}
+	if target == "" {
+		t.Fatalf("file %q not in the listing", name)
+	}
+	f, err := fs.OpenFile(target, os.O_RDONLY)
+	if !errors.Is(err, iso9660.ErrFileExtent) {
+		if f != nil {
+			n, rerr := io.Copy(io.Discard, f)
+			t.Logf("copied %d bytes, err %v", n, rerr)
+		}
+		t.Fatalf("OpenFile(%s): got %v, want ErrFileExtent", target, err)
+	}
+}
+
+// A volume that states more than the file holds (the descriptor says 11 MB, the file ends early) and a file whose extent
+// runs past that end: the bytes the file does not hold are not given. Read returns what the backend gave and an error.
+func TestHostileFileExtentPastTheEndOfTheFileIsNotMadeUp(t *testing.T) {
+	b, root := hostileISO(t)
+	off, name := firstFileRecord(t, b, root)
+	pvd := b[16*hostileDirBlock:]
+	blocks := int64(binary.LittleEndian.Uint32(pvd[80:])) // Volume Space Size (8.4.8)
+	setRecordSize(b, off, 2048)                           // one block, at the last block of the volume: inside the stated volume
+	binary.LittleEndian.PutUint32(b[off+2:], uint32(blocks-1))
+	binary.BigEndian.PutUint32(b[off+6:], uint32(blocks-1))
+	b = b[:(blocks-1)*hostileDirBlock+100] // the file holds 100 bytes of that block
+	fs := openISO(t, b)
+	des, _ := fs.ReadDir(".")
+	var target string
+	for _, de := range des {
+		if !de.IsDir() && len(name) >= len(de.Name()) && name[:len(de.Name())] == de.Name() {
+			target = de.Name()
+		}
+	}
+	f, err := fs.OpenFile(target, os.O_RDONLY)
+	if err != nil {
+		t.Fatalf("OpenFile(%s): %v", target, err)
+	}
+	buf := bytes.Repeat([]byte{0xAA}, 2048)
+	n, rerr := f.Read(buf)
+	t.Logf("Read: %d bytes, %v", n, rerr)
+	if n > 100 || !errors.Is(rerr, io.ErrUnexpectedEOF) {
+		t.Errorf("Read gave %d bytes and %v, want at most 100 and ErrUnexpectedEOF", n, rerr)
+	}
+}
+
+// The same refusal through Open (io/fs).
+func TestHostileFileExtentPastVolumeIsRefusedByOpen(t *testing.T) {
+	b, root := hostileISO(t)
+	off, name := firstFileRecord(t, b, root)
+	setRecordSize(b, off, 0x7FFFFFFF)
+	fs := openISO(t, b)
+	des, _ := fs.ReadDir(".")
+	for _, de := range des {
+		if !de.IsDir() && len(name) >= len(de.Name()) && name[:len(de.Name())] == de.Name() {
+			if _, err := fs.Open(de.Name()); !errors.Is(err, iso9660.ErrFileExtent) {
+				t.Fatalf("Open(%s): got %v, want ErrFileExtent", de.Name(), err)
+			}
+			return
+		}
+	}
+	t.Fatalf("file %q not in the listing", name)
 }

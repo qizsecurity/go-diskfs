@@ -113,6 +113,29 @@ func (fsm *FileSystem) HeldBytes() int64 {
 	return n
 }
 
+// ErrFileExtent is wrapped by the error OpenFile returns when a file's extent does not fit the volume.
+var ErrFileExtent = errors.New("file extent does not fit the volume")
+
+// checkFileExtent refuses a file whose extent the volume does not hold: its Directory Record states the first Logical
+// Block (9.1.3, page 36) and the data length of the File Section (9.1.4, page 36), and the extent, location x Logical
+// Block Size + data length, must lie within the Volume Space (8.4.8 x 8.4.12, pages 25 and 26; the reader's size when the
+// caller gave a smaller one). A file with no bytes names no extent. Nothing is read for a refused file: bytes the volume
+// does not hold would be made up.
+func (fsm *FileSystem) checkFileExtent(p string, location, size uint32) error {
+	if size == 0 {
+		return nil
+	}
+	bound, known := fsm.volumeSpaceBytes()
+	if !known {
+		return nil
+	}
+	if end := int64(location)*fsm.blocksize + int64(size); end > bound {
+		return fmt.Errorf("file %s: its extent (%d bytes from block %d of %d bytes) ends at byte %d, past the %d bytes of the volume (Volume Space Size x Logical Block Size, ECMA-119 8.4.8, 8.4.12): %w",
+			p, size, location, fsm.blocksize, end, bound, ErrFileExtent)
+	}
+	return nil
+}
+
 // ErrPathTableExtent is wrapped by the error Read returns when a path table's extent does not fit the volume.
 var ErrPathTableExtent = errors.New("path table extent does not fit the volume")
 
