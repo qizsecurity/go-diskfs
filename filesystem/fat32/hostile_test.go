@@ -696,22 +696,60 @@ func TestHostileOpenOnceDistinctFilesUnchanged(t *testing.T) {
 	}
 }
 
-// HeldBytes counts the sets ReadDirOnce and OpenOnce keep: one entry for each directory listed and each file opened.
+// HeldBytes counts what ReadDirOnce and OpenOnce keep: for the path a/b and the file one.txt, on the 40 MiB volume of
+// hostileBase (512-byte sectors).
+//
+//	ReadDirOnce("a/b"): the first-cluster set of directories (1 entry, 24 bytes), the bitmap of claimed clusters (one
+//	  bit for each data cluster 0 .. n+1, in 8-byte words, calculated below from the BPB), and the listings of the three
+//	  directories of the path (root, a, b), counted by the fork per entry (measured here against the heap).
+//	OpenOnce("a/b/one.txt"): the first-cluster set of files (1 entry, 24 bytes); the path is held already, its chain's
+//	  bits are in the bitmap: nothing else.
+//
+// The old expectation, 2 x 24 bytes, was true before the bitmap and the listings were counted: it left the bytes the
+// reader holds out of the charge, which is the defect this test now pins the other way.
 func TestHostileHeldBytesCountsEnteredSets(t *testing.T) {
-	fs, err := hostileOpen(t, hostileBase(t))
+	b := hostileBase(t)
+	fs, err := hostileOpen(t, b)
 	if err != nil {
 		t.Fatal(err)
 	}
+	reserved, spf := hostileGeometry(b)
+	spc := uint32(b[0x0D])
+	// n data clusters: (volume - (reserved + 2 FATs) sectors) / sectors per cluster, rounded down (specification,
+	// section 3.5, page 14-15: CountofClusters; MAX = n + 1). The bitmap has n + 2 bits (clusters 0 .. MAX).
+	n := (uint32(hostileVolume/hostileSectors) - reserved - 2*spf) / spc
+	bitmap := int64((n+2+63)/64) * 8
+
+	var m0, m1 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m0)
 	before := fs.HeldBytes()
 	if _, err := fs.ReadDirOnce("a/b"); err != nil {
 		t.Fatal(err)
 	}
+	runtime.GC()
+	runtime.ReadMemStats(&m1)
+	heap := int64(m1.HeapAlloc) - int64(m0.HeapAlloc)
+	afterDir := fs.HeldBytes()
 	f, err := fs.OpenOnce("a/b/one.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = f.Close()
-	if got, want := fs.HeldBytes()-before, int64(2*24); got != want {
-		t.Errorf("HeldBytes grew by %d, want %d (one directory, one file)", got, want)
+	afterFile := fs.HeldBytes()
+
+	if got := afterFile - afterDir; got != 24 {
+		t.Errorf("OpenOnce of a file on the held path grew HeldBytes by %d, want 24 (one first cluster)", got)
+	}
+	listings := afterDir - before - 24 - bitmap
+	t.Logf("HeldBytes %d -> %d -> %d; bitmap %d (n=%d); listings %d; heap in use grew by %d", before, afterDir, afterFile, bitmap, n, listings, heap)
+	if listings <= 0 {
+		t.Fatalf("the listings of the path are not counted: HeldBytes grew by %d, 24 + bitmap %d leave %d", afterDir-before, bitmap, listings)
+	}
+	// The charge covers what the heap holds: HeldBytes grew by at least the heap growth less 5 percent, and not by more
+	// than that plus 5 percent and 1 KiB (the heap of a few small directories is measured to the size classes).
+	grew := afterDir - before
+	if grew < heap-heap/20 || grew > heap+heap/20+1024 {
+		t.Errorf("HeldBytes grew by %d, the heap by %d: the charge must cover the hold, within 5 percent + 1 KiB", grew, heap)
 	}
 }
