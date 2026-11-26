@@ -1300,6 +1300,10 @@ func abs(x int) int {
 // ReadDirOnce or OpenOnce of this volume claimed.
 var ErrChainsOverlap = errors.New("cluster chains overlap")
 
+// ErrFileSizeBeyondChain is wrapped by the error File.Read returns when the file's size is past the end of its cluster
+// chain.
+var ErrFileSizeBeyondChain = errors.New("file size is beyond its cluster chain")
+
 // ErrFileAlreadyEntered is returned by OpenOnce for a file whose first cluster an earlier OpenOnce of this volume
 // already opened.
 var ErrFileAlreadyEntered = errors.New("file already entered by another path")

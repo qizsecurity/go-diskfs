@@ -461,7 +461,7 @@ func TestHostileFileSizeLargerThanItsChainEndsWithAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	n, err := io.Copy(io.Discard, f)
-	if err == nil || !strings.Contains(err.Error(), "larger than its cluster chain") {
+	if !errors.Is(err, fat12.ErrFileSizeBeyondChain) || !strings.Contains(err.Error(), "larger than its cluster chain") {
 		t.Fatalf("read %d bytes, err %v, want an error that the size is larger than the chain", n, err)
 	}
 	if n > 1<<20 {
