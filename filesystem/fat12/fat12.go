@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/diskfs/go-diskfs/backend"
 	"github.com/diskfs/go-diskfs/filesystem"
@@ -50,6 +51,14 @@ type FileSystem struct {
 	entered   map[uint32]struct{}
 	// enteredFiles holds the first clusters of the files OpenOnce has opened.
 	enteredFiles map[uint32]struct{}
+	// claimed has one bit for each cluster 0 .. maxDataCluster: set when a chain that ReadDirOnce or OpenOnce met
+	// holds that cluster. Allocated on the first claim (under enteredMu); HeldBytes counts it.
+	claimed []uint64
+	// stack holds the directories of the path the last ReadDirOnce or OpenOnce resolved, root first, so the next
+	// path of a walk shares them and reads only the levels below the first that differs. It is held until a write
+	// to a directory or until ReadDirOnce/OpenOnce resolve a path that leaves it; HeldBytes counts it.
+	stackMu sync.Mutex
+	stack   []dirLevel
 	// AfterWriteFAT, when non-nil, is called at the end of WriteFat. FAT32
 	// uses this to flush the FSInformationSector after every FAT change.
 	AfterWriteFAT func() error
@@ -536,11 +545,18 @@ func (fs *FileSystem) Open(p string) (iofs.File, error) {
 
 func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 	dir := path.Dir(p)
-	filename := path.Base(p)
 	parentDir, entries, err := fs.readDirWithMkdir(dir, false)
 	if err != nil {
 		return nil, fmt.Errorf("could not read directory entries for %s: %w", dir, err)
 	}
+	return fs.openIn(p, flag, parentDir, entries)
+}
+
+// openIn is OpenFile after the parent directory of p is resolved.
+func (fs *FileSystem) openIn(p string, flag int, parentDir *Directory, entries []*directoryEntry) (filesystem.File, error) {
+	dir := path.Dir(p)
+	filename := path.Base(p)
+	var err error
 	var targetEntry *directoryEntry
 	if filename == dir {
 		targetEntry = &parentDir.directoryEntry
@@ -766,12 +782,26 @@ func (fs *FileSystem) maxDataCluster() uint32 {
 }
 
 func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
+	clusterList, _, err := fs.walkChain(firstCluster, nil)
+	if err != nil {
+		return nil, err
+	}
+	return clusterList, nil
+}
+
+// walkChain follows the chain that starts at firstCluster. It returns the clusters it walked, also with an error (the
+// part walked before the chain was refused). When stop is not nil and reports true for a cluster, the walk ends before
+// that cluster is added: it returns the clusters before it, that cluster, and stopped = true. The chain checks are
+// those of the specification: the FAT is a singly linked list that ends at an EOC mark (FAT32 File System
+// Specification, section 4, page 16), a next cluster is 2 .. MAX (page 16; MAX = CountofClusters + 1, page 15), and a
+// chain longer than the count of data clusters revisits one.
+func (fs *FileSystem) walkChain(firstCluster uint32, stop func(uint32) bool) (list []uint32, stoppedAt uint32, err error) {
 	if firstCluster > fs.table.MaxCluster() || fs.table.ClusterValue(firstCluster) == 0 {
-		return nil, fmt.Errorf("invalid start cluster: %d", firstCluster)
+		return nil, 0, fmt.Errorf("invalid start cluster: %d", firstCluster)
 	}
 	last := fs.maxDataCluster()
 	if firstCluster > last {
-		return nil, fmt.Errorf("invalid start cluster: %d is past the last data cluster %d of the volume", firstCluster, last)
+		return nil, 0, fmt.Errorf("invalid start cluster: %d is past the last data cluster %d of the volume", firstCluster, last)
 	}
 	// A chain of distinct data clusters is at most last-1 long (clusters 2..last): a longer chain revisits a cluster.
 	maxLen := int(last) - 1
@@ -779,7 +809,10 @@ func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
 	cluster := firstCluster
 	for {
 		if len(clusterList) >= maxLen {
-			return nil, fmt.Errorf("invalid cluster chain from %d: it revisits a cluster (more than the %d data clusters of the volume)", firstCluster, maxLen)
+			return clusterList, 0, fmt.Errorf("invalid cluster chain from %d: it revisits a cluster (more than the %d data clusters of the volume)", firstCluster, maxLen)
+		}
+		if stop != nil && stop(cluster) {
+			return clusterList, cluster, nil
 		}
 		clusterList = append(clusterList, cluster)
 		next := fs.table.ClusterValue(cluster)
@@ -787,17 +820,40 @@ func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
 			break
 		}
 		if next > fs.table.MaxCluster() {
-			return nil, fmt.Errorf("invalid cluster chain at %d", next)
+			return clusterList, 0, fmt.Errorf("invalid cluster chain at %d", next)
 		}
 		if next > last {
-			return nil, fmt.Errorf("invalid cluster chain at %d: past the last data cluster %d of the volume", next, last)
+			return clusterList, 0, fmt.Errorf("invalid cluster chain at %d: past the last data cluster %d of the volume", next, last)
 		}
 		if cluster < 2 {
-			return nil, fmt.Errorf("invalid cluster chain at %d", cluster)
+			return clusterList, 0, fmt.Errorf("invalid cluster chain at %d", cluster)
 		}
 		cluster = next
 	}
-	return clusterList, nil
+	return clusterList, 0, nil
+}
+
+// claimChain claims every cluster of the chain that starts at first for the caller's path, for ReadDirOnce and
+// OpenOnce. It returns the first cluster of the chain that another claim already holds (overlap = true, and the chain
+// is not walked further), or the error of a chain the specification does not allow (a loop, a cluster outside the
+// volume). The clusters walked are claimed also when it returns either, so a later chain that enters them stops at its
+// first cluster that is held: every cluster is walked at most once for all the chains of one walk of the volume.
+// first == 0 names no chain (an empty file, or the fixed root directory of FAT12/16) and claims nothing.
+func (fs *FileSystem) claimChain(first uint32) (overlapAt uint32, overlap bool, err error) {
+	if first == 0 {
+		return 0, false, nil
+	}
+	fs.enteredMu.Lock()
+	defer fs.enteredMu.Unlock()
+	if fs.claimed == nil {
+		fs.claimed = make([]uint64, (uint64(fs.maxDataCluster())+1+63)/64)
+	}
+	held := func(c uint32) bool { return int(c>>6) < len(fs.claimed) && fs.claimed[c>>6]&(1<<(c&63)) != 0 }
+	list, at, err := fs.walkChain(first, held)
+	for _, c := range list {
+		fs.claimed[c>>6] |= 1 << (c & 63)
+	}
+	return at, err == nil && at != 0, err
 }
 
 // VolumeBytes is the size of the volume a reader may rely on: the size the caller gives, or the volume's own
@@ -814,12 +870,23 @@ func VolumeBytes(size int64, totalSectors, bytesPerSector uint32) int64 {
 // this once per opened volume; fat32.Read holds up to two more tables of this size while it opens the volume.
 //
 // It also counts the sets of first clusters that ReadDirOnce and OpenOnce keep, one entry for each directory listed
-// and each file opened, at enteredEntryBytes each, so a caller that reads it again after a walk sees them.
+// and each file opened, at enteredEntryBytes each, and the bitmap of claimed clusters (one bit for each data cluster,
+// allocated by the first ReadDirOnce or OpenOnce), and the listings of the directories of the last path they resolved
+// (dirLevel.bytes: the entries' structs, pointers and strings), so a caller that reads it again after a walk sees them. The list of
+// clusters of the chain that one claim walks is not held after it: it is at most the table's size, 4 bytes for each
+// cluster, and is held while the claim runs.
 func (fs *FileSystem) HeldBytes() int64 {
 	fs.enteredMu.Lock()
 	entries := int64(len(fs.entered) + len(fs.enteredFiles))
+	claimed := int64(len(fs.claimed)) * 8
 	fs.enteredMu.Unlock()
-	return (int64(fs.table.MaxCluster())+1)*4 + entries*enteredEntryBytes
+	fs.stackMu.Lock()
+	var stack int64
+	for _, l := range fs.stack {
+		stack += l.bytes
+	}
+	fs.stackMu.Unlock()
+	return (int64(fs.table.MaxCluster())+1)*4 + entries*enteredEntryBytes + claimed + stack
 }
 
 // enteredEntryBytes is what one entry of a map[uint32]struct{} holds, measured on go1.27.3 darwin/arm64 for 1e3, 1e5
@@ -840,7 +907,7 @@ func (fs *FileSystem) ReadDirOnce(p string) ([]iofs.DirEntry, error) {
 	if err := validatePath(p); err != nil {
 		return nil, err
 	}
-	dir, entries, err := fs.readDirWithMkdir(p, false)
+	dir, entries, err := fs.resolveDir(p, false, true)
 	if err != nil {
 		return nil, fmt.Errorf("error reading directory %s: %w", p, err)
 	}
@@ -853,6 +920,12 @@ func (fs *FileSystem) ReadDirOnce(p string) ([]iofs.DirEntry, error) {
 	fs.enteredMu.Unlock()
 	if again {
 		return nil, fmt.Errorf("directory %s (first cluster %d): %w", p, dir.clusterLocation, ErrDirectoryAlreadyEntered)
+	}
+	// A directory is a file (FAT32 File System Specification, section 4, page 16: "A FAT directory or file container
+	// is simply a regular file with a special attribute"), so its chain is disjoint from every other chain.
+	if at, overlap, _ := fs.claimChain(dir.clusterLocation); overlap {
+		return nil, fmt.Errorf("directory %s (first cluster %d): its chain reaches cluster %d, which belongs to a chain already read: %w",
+			p, dir.clusterLocation, at, ErrChainsOverlap)
 	}
 	ret := make([]iofs.DirEntry, 0, len(entries))
 	for _, e := range entries {
@@ -919,6 +992,9 @@ func (fs *FileSystem) readDirectory(dir *Directory) ([]*directoryEntry, error) {
 }
 
 func (fs *FileSystem) writeDirectoryEntries(dir *Directory) error {
+	fs.stackMu.Lock()
+	fs.stack = nil
+	fs.stackMu.Unlock()
 	// Fixed root directory for FAT12/16.
 	if fs.isRootCluster(dir.clusterLocation) {
 		b, err := dir.entriesToBytesFixed(fs.rootDirMaxEntries * 32)
@@ -993,23 +1069,72 @@ func (fs *FileSystem) mkLabel(parent *Directory, name string) (*directoryEntry, 
 }
 
 func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*directoryEntry, error) {
+	return fs.resolveDir(p, doMake, false)
+}
+
+// dirLevel is one directory of the stack of the last resolved path: the component that names it, the directory, its
+// listing, and what the listing holds in memory.
+type dirLevel struct {
+	name    string
+	dir     *Directory
+	entries []*directoryEntry
+	bytes   int64
+}
+
+// dirEntryBytes is what one listed entry holds in memory: its struct, its slot in the listing's pointer slice
+// (8 bytes, up to twice that while the slice grew by append), and its strings, each rounded up to the 16-byte steps
+// of Go's small size classes. Measured on go1.27.3 darwin/arm64 for a listing of 4,096 entries: this is within 5 percent of
+// the heap the listing holds (fat32/hostile_overlap_test.go, TestHostileHeldBytesCountsTheStack).
+func dirEntryBytes(e *directoryEntry) int64 {
+	up := func(n int) int64 { return int64((n + 15) &^ 15) }
+	return up(int(unsafe.Sizeof(*e))) + 16 +
+		up(len(e.filenameShort)) + up(len(e.fileExtension)) + up(len(e.filenameLong))
+}
+
+func levelBytes(entries []*directoryEntry) int64 {
+	var n int64
+	for _, e := range entries {
+		n += dirEntryBytes(e)
+	}
+	return n
+}
+
+// resolveDir resolves directory p. With useStack it reuses the directories of the path it resolved last (fs.stack) as
+// far as the components are the same, and reads only the levels below: a walk of a tree then reads each directory
+// once for the path that reaches it, not once for each path that passes through it (a directory of n subdirectories
+// was read n times, n x its size; a directory of n files, n times). The checks of one path are the same.
+func (fs *FileSystem) resolveDir(p string, doMake bool, useStack bool) (*Directory, []*directoryEntry, error) {
 	paths := splitPath(p)
+	if useStack {
+		fs.stackMu.Lock()
+		defer fs.stackMu.Unlock()
+	}
 	// Root directory: clusterLocation = 0 for FAT12/16 (fixed region).
 	rootCluster := uint32(0)
 	if fs.rootDirMaxEntries == 0 {
 		// FAT32-style: use cluster 2.
 		rootCluster = fs.table.RootDirCluster()
 	}
-	currentDir := &Directory{
-		directoryEntry: directoryEntry{
-			clusterLocation: rootCluster,
-			isSubdirectory:  true,
-			filesystem:      fs,
-		},
-	}
-	entries, err := fs.readDirectory(currentDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to read root directory: %w", err)
+	var currentDir *Directory
+	var entries []*directoryEntry
+	var err error
+	if useStack && len(fs.stack) > 0 {
+		currentDir, entries = fs.stack[0].dir, fs.stack[0].entries
+	} else {
+		currentDir = &Directory{
+			directoryEntry: directoryEntry{
+				clusterLocation: rootCluster,
+				isSubdirectory:  true,
+				filesystem:      fs,
+			},
+		}
+		entries, err = fs.readDirectory(currentDir)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read root directory: %w", err)
+		}
+		if useStack {
+			fs.stack = append(fs.stack[:0], dirLevel{dir: currentDir, entries: entries, bytes: levelBytes(entries)})
+		}
 	}
 	// The directories on the path so far, by first cluster. A subdirectory entry that names one of them makes the
 	// tree a cycle (a directory that holds itself or an ancestor), which no valid volume holds.
@@ -1018,6 +1143,15 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*di
 		return currentDir, entries, nil
 	}
 	for i, subp := range paths {
+		if useStack && len(fs.stack) > i+1 && fs.stack[i+1].name == subp {
+			// The same directory as the last path: its listing is held, and its place on the path was checked then.
+			currentDir, entries = fs.stack[i+1].dir, fs.stack[i+1].entries
+			onPath[currentDir.clusterLocation] = struct{}{}
+			continue
+		}
+		if useStack {
+			fs.stack = fs.stack[:i+1]
+		}
 		found := false
 		for _, e := range entries {
 			if e.isVolumeLabel {
@@ -1072,6 +1206,9 @@ func (fs *FileSystem) readDirWithMkdir(p string, doMake bool) (*Directory, []*di
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read directory %s: %w",
 				"/"+strings.Join(paths[0:i+1], "/"), err)
+		}
+		if useStack {
+			fs.stack = append(fs.stack, dirLevel{name: subp, dir: currentDir, entries: entries, bytes: levelBytes(entries)})
 		}
 	}
 	return currentDir, entries, nil
@@ -1159,6 +1296,10 @@ func abs(x int) int {
 	return x
 }
 
+// ErrChainsOverlap is returned by OpenOnce for a file whose cluster chain shares a cluster with a chain an earlier
+// ReadDirOnce or OpenOnce of this volume claimed.
+var ErrChainsOverlap = errors.New("cluster chains overlap")
+
 // ErrFileAlreadyEntered is returned by OpenOnce for a file whose first cluster an earlier OpenOnce of this volume
 // already opened.
 var ErrFileAlreadyEntered = errors.New("file already entered by another path")
@@ -1171,7 +1312,11 @@ var ErrFileAlreadyEntered = errors.New("file already entered by another path")
 // refused. The set holds one first cluster for each file opened (HeldBytes counts it), so it grows with the number
 // of files, never with their size. Use it for a walk of the whole tree, with ReadDirOnce.
 func (fs *FileSystem) OpenOnce(p string) (iofs.File, error) {
-	f, err := fs.OpenFile(p, os.O_RDONLY)
+	parentDir, entries, err := fs.resolveDir(path.Dir(p), false, true)
+	if err != nil {
+		return nil, fmt.Errorf("could not read directory entries for %s: %w", path.Dir(p), err)
+	}
+	f, err := fs.openIn(p, os.O_RDONLY, parentDir, entries)
 	if err != nil {
 		return nil, err
 	}
@@ -1190,6 +1335,16 @@ func (fs *FileSystem) OpenOnce(p string) (iofs.File, error) {
 	if again {
 		_ = f.Close()
 		return nil, fmt.Errorf("file %s (first cluster %d): %w", p, first, ErrFileAlreadyEntered)
+	}
+	// A cluster is in the chain of one file: the FAT entry of a cluster holds one next cluster (section 4, page 16),
+	// so two chains that share a cluster hold the same bytes under two names. A chain that is looped or leaves the
+	// volume is not refused here: reading the file ends with that error (getClusterList).
+	if !fl.isSubdirectory {
+		if at, overlap, _ := fs.claimChain(first); overlap {
+			_ = f.Close()
+			return nil, fmt.Errorf("file %s (first cluster %d): its chain reaches cluster %d, which belongs to a chain already read: %w",
+				p, first, at, ErrChainsOverlap)
+		}
 	}
 	return f, nil
 }

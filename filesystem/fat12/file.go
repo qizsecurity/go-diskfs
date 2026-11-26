@@ -133,6 +133,12 @@ func (fl *File) Read(b []byte) (int, error) {
 	// figure out which cluster we start with
 	if fl.offset > 0 {
 		clusterIndex = int(fl.offset / int64(bytesPerCluster))
+		if clusterIndex >= len(clusters) {
+			// DIR_FileSize (FAT32 File System Specification, section 6, page 24) is the size of the file; its chain
+			// is the clusters that hold it. A size past the end of the chain names bytes the volume does not give
+			// to this file.
+			return totalRead, fmt.Errorf("file size %d is larger than its cluster chain of %d clusters", fl.fileSize, len(clusters))
+		}
 		lastCluster := clusters[clusterIndex]
 		// read any partials, if needed
 		remainder := fl.offset % int64(bytesPerCluster)
