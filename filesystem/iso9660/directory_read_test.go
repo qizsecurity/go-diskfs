@@ -168,3 +168,116 @@ func TestDirectoryOfSeveralBlocksIsReadThroughTheWindow(t *testing.T) {
 		t.Errorf("HeldBytes %d does not count the window of %d bytes", held, hostileDirBlock)
 	}
 }
+
+// The Primary Volume Descriptor states a Path Table Size of 4 GiB - 1 (8.4.13, BP 133 to 140, both byte orders): Read
+// refuses the volume with the typed error and allocates nothing for the stated size. Before: make([]byte, pathTableSize).
+func TestHostilePathTableExtentLargerThanVolumeIsRefused(t *testing.T) {
+	b, _ := hostileISO(t)
+	pvd := b[16*hostileDirBlock:]
+	binary.LittleEndian.PutUint32(pvd[132:], 0xFFFFFFFF)
+	binary.BigEndian.PutUint32(pvd[136:], 0xFFFFFFFF)
+	p := filepath.Join(t.TempDir(), "hostile-pt.iso")
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var rerr error
+	alloc := allocOf(func() { _, rerr = iso9660.Read(file.New(f, true), 0, 0, hostileDirBlock) })
+	t.Logf("Read: %v; allocated %d KiB", rerr, alloc>>10)
+	if !errors.Is(rerr, iso9660.ErrPathTableExtent) {
+		t.Fatalf("got %v, want ErrPathTableExtent", rerr)
+	}
+	if alloc > 1<<20 {
+		t.Errorf("allocated %d bytes for a refused path table, want at most 1 MiB", alloc)
+	}
+}
+
+// The CE entry of the root's own record (rockridge.iso, block 18) states a continuation area of 4 GiB - 1 bytes (SUSP 1.12
+// section 5.1, BP 21 to 28, both byte orders): Read refuses it with the typed error and allocates nothing for the stated
+// length. Before: make([]byte, ContinuationLength()).
+func TestHostileContinuationAreaLargerThanVolumeIsRefused(t *testing.T) {
+	b, err := os.ReadFile("./testdata/rockridge.iso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// find the CE entry (signature "CE", length 28) in the System Use area of the first record of block 18
+	rec := b[18*hostileDirBlock:]
+	su := 33 + int(rec[32])
+	if rec[32]%2 == 0 {
+		su++ // padding byte after an even-length File Identifier (9.1, Table 8)
+	}
+	ce := -1
+	for j := su; j+4 <= int(rec[0]); {
+		if string(rec[j:j+2]) == "CE" && rec[j+2] == 28 {
+			ce = j
+			break
+		}
+		if rec[j+2] < 4 {
+			break
+		}
+		j += int(rec[j+2])
+	}
+	if ce < 0 {
+		t.Fatal("no CE entry in the first record of block 18 of rockridge.iso")
+	}
+	binary.LittleEndian.PutUint32(rec[ce+20:], 0xFFFFFFFF)
+	binary.BigEndian.PutUint32(rec[ce+24:], 0xFFFFFFFF)
+	p := filepath.Join(t.TempDir(), "hostile-ce.iso")
+	if err := os.WriteFile(p, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	var rerr error
+	alloc := allocOf(func() { _, rerr = iso9660.Read(file.New(f, true), 0, 0, hostileDirBlock) })
+	t.Logf("Read: %v; allocated %d KiB", rerr, alloc>>10)
+	if !errors.Is(rerr, iso9660.ErrContinuationArea) {
+		t.Fatalf("got %v, want ErrContinuationArea", rerr)
+	}
+	if alloc > 1<<20 {
+		t.Errorf("allocated %d bytes for a refused area, want at most 1 MiB", alloc)
+	}
+}
+
+// A path table of several logical blocks (300 directories, about 16 bytes a record: more than 2 windows) is read through
+// the window with records carried across its edges: every directory is found by its path, which is the path table's job.
+func TestPathTableOfSeveralBlocksIsReadThroughTheWindow(t *testing.T) {
+	const n = 300
+	f, err := os.CreateTemp(t.TempDir(), "pt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fs, err := iso9660.Create(file.New(f, false), 0, 0, hostileDirBlock, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		if err := fs.Mkdir(fmt.Sprintf("/DIR%05d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fs.Finalize(iso9660.FinalizeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := f.Stat()
+	rd, err := iso9660.Read(file.New(f, true), st.Size(), 0, hostileDirBlock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held := rd.HeldBytes(); held < n*16 {
+		t.Errorf("HeldBytes %d does not count the %d path table records", held, n)
+	}
+	for _, i := range []int{0, 127, 128, 129, n - 1} {
+		if _, err := rd.ReadDir(fmt.Sprintf("DIR%05d", i)); err != nil {
+			t.Errorf("ReadDir(DIR%05d): %v", i, err)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package iso9660
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	iofs "io/fs"
@@ -221,23 +222,20 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 	)
 	if pvd != nil {
 		rootDirEntry = pvd.rootDirectoryEntry
-		pathTableBytes := make([]byte, pvd.pathTableSize)
-		pathTableLocation := pvd.pathTableLLocation * uint32(pvd.blocksize)
-		read, err = b.ReadAt(pathTableBytes, int64(pathTableLocation))
+		pt, err = readPathTable(b, pvd, size, pvd.pathTableLLocation, pvd.pathTableSize, int64(pvd.blocksize), false)
 		if err != nil {
-			return nil, fmt.Errorf("unable to read path table of size %d at location %d: %v", pvd.pathTableSize, pathTableLocation, err)
+			return nil, fmt.Errorf("path table: %w", err)
 		}
-		if read != len(pathTableBytes) {
-			return nil, fmt.Errorf("read %d bytes of path table instead of expected %d at location %d", read, pvd.pathTableSize, pathTableLocation)
-		}
-		pt = parsePathTable(pathTableBytes)
 	}
 
 	// load Joliet path table and root if present
-	jolietPT, jolietRootDir, jolietEnabled := loadJoliet(jolietSVD, b)
+	jolietPT, jolietRootDir, jolietEnabled, err := loadJoliet(jolietSVD, pvd, size, b)
+	if err != nil {
+		return nil, fmt.Errorf("Joliet path table: %w", err)
+	}
 
 	// detect SUSP/Rock Ridge from root directory entry
-	suspEnabled, skipBytes, suspHandlers, err := detectSUSP(rootDirEntry, b, blocksize)
+	suspEnabled, skipBytes, suspHandlers, err := detectSUSP(rootDirEntry, b, blocksize, pvd, size)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +268,7 @@ func Read(b backend.Storage, size, start, blocksize int64) (*FileSystem, error) 
 }
 
 // detectSUSP reads the root directory entry and checks for SUSP/Rock Ridge extensions.
-func detectSUSP(rootDirEntry *directoryEntry, b backend.Storage, blocksize int64) (suspFound bool, suspSkip uint8, extensions []suspExtension, err error) {
+func detectSUSP(rootDirEntry *directoryEntry, b backend.Storage, blocksize int64, pvd *primaryVolumeDescriptor, size int64) (suspFound bool, suspSkip uint8, extensions []suspExtension, err error) {
 	location := int64(rootDirEntry.location) * blocksize
 	dirEntBytes := make([]byte, 1)
 	read, err := b.ReadAt(dirEntBytes, location)
@@ -295,9 +293,11 @@ func detectSUSP(rootDirEntry *directoryEntry, b backend.Storage, blocksize int64
 		suspEnabled: true,
 		backend:     b,
 		blocksize:   blocksize,
+		volumes:     volumeDescriptors{primary: pvd}, // the volume's own size bounds a continuation area (readContinuation)
+		size:        size,
 	})
 	if err != nil {
-		return false, 0, nil, fmt.Errorf("error parsing root entry from bytes: %v", err)
+		return false, 0, nil, fmt.Errorf("error parsing root entry from bytes: %w", err)
 	}
 	var (
 		suspEnabled  bool
@@ -320,19 +320,20 @@ func detectSUSP(rootDirEntry *directoryEntry, b backend.Storage, blocksize int64
 }
 
 // loadJoliet loads the Joliet path table and root directory entry from a supplementary volume descriptor.
-func loadJoliet(svd *supplementaryVolumeDescriptor, b backend.Storage) (*pathTable, *directoryEntry, bool) {
+func loadJoliet(svd *supplementaryVolumeDescriptor, pvd *primaryVolumeDescriptor, size int64, b backend.Storage) (*pathTable, *directoryEntry, bool, error) {
 	if svd == nil {
-		return nil, nil, false
+		return nil, nil, false, nil
 	}
 	rootDir := svd.rootDirectoryEntry
 	rootDir.joliet = true
-	pathTableBytes := make([]byte, svd.pathTableSize)
-	ptLoc := svd.pathTableLLocation * uint32(svd.blocksize)
-	read, err := b.ReadAt(pathTableBytes, int64(ptLoc))
-	if err != nil || read != len(pathTableBytes) {
-		return nil, rootDir, false
+	pt, err := readPathTable(b, pvd, size, svd.pathTableLLocation, svd.pathTableSize, int64(svd.blocksize), true)
+	switch {
+	case errors.Is(err, ErrPathTableExtent):
+		return nil, nil, false, err // a bound the volume states: stated, not a Joliet tree quietly left out
+	case err != nil:
+		return nil, rootDir, false, nil // unchanged: a Joliet table that cannot be read leaves the Joliet tree out
 	}
-	return parseJolietPathTable(pathTableBytes), rootDir, true
+	return pt, rootDir, true, nil
 }
 
 // interface guard

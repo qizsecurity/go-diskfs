@@ -312,19 +312,15 @@ func parseDirEntry(b []byte, f *FileSystem) (*directoryEntry, error) {
 		// if the last entry is a continuation SUSP entry and SUSP is enabled, we need to follow and parse them
 		// because the extensions can be a linked list directory -> CE area -> CE area ...
 		//   we need to loop until it is no more
+		seen := map[[3]int64]struct{}{}
 		for {
 			if ce, ok := de.extensions[len(de.extensions)-1].(directoryEntrySystemUseContinuation); ok {
 				location := int64(ce.Location())
-				size := int(ce.ContinuationLength())
 				offset := int64(ce.Offset())
-				// read it from disk
-				continuationBytes := make([]byte, size)
-				read, err := f.backend.ReadAt(continuationBytes, location*f.blocksize+offset)
+				// read it from disk, after its area is checked against the volume
+				continuationBytes, err := f.readContinuation(location, offset, ce.ContinuationLength(), seen)
 				if err != nil {
-					return nil, fmt.Errorf("error reading continuation entry data at %d: %v", location, err)
-				}
-				if read != size {
-					return nil, fmt.Errorf("read continuation entry data %d bytes instead of expected %d", read, size)
+					return nil, err
 				}
 				// parse and append
 				entries, err := parseDirectoryEntryExtensions(continuationBytes, f.suspExtensions)
