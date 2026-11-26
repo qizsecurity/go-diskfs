@@ -354,6 +354,10 @@ func parseDirEntries(b []byte, f *FileSystem) ([]*directoryEntry, error) {
 			i += (int(f.blocksize) - i%int(f.blocksize))
 			continue
 		}
+		if i+entryLen > len(b) {
+			// ECMA-119 4th edition 6.8.1.1, page 11: each Directory Record ends in the Logical Sector in which it begins.
+			return nil, fmt.Errorf("directory entry %d at byte %d states a length of %d, past the end of its logical block", count, i, entryLen)
+		}
 		de, err := parseDirEntry(b[i+0:i+entryLen], f)
 		if err != nil {
 			return nil, fmt.Errorf("invalid directory entry %d at byte %d: %v", count, i, err)
@@ -387,6 +391,9 @@ func parseDirEntriesJoliet(b []byte, f *FileSystem) ([]*directoryEntry, error) {
 			i += (int(f.blocksize) - i%int(f.blocksize))
 			continue
 		}
+		if i+entryLen > len(b) {
+			return nil, fmt.Errorf("Joliet directory entry %d at byte %d states a length of %d, past the end of its logical block", count, i, entryLen)
+		}
 		de, err := dirEntryFromBytesWithJoliet(b[i:i+entryLen], nil, true)
 		if err != nil {
 			return nil, fmt.Errorf("invalid Joliet directory entry %d at byte %d: %v", count, i, err)
@@ -407,19 +414,10 @@ func (de *directoryEntry) getLocation(p string) (location, size uint32, err erro
 		size = de.size
 	} else {
 		current := parts[0]
-		// read the directory bytes
-		dirb := make([]byte, de.size)
-		n, err := de.filesystem.backend.ReadAt(dirb, int64(de.location)*de.filesystem.blocksize)
+		// read the directory, through a window, after its extent is checked against the volume
+		dirEntries, err := de.filesystem.readDirExtent("directory "+p, de.location, de.size, func(b []byte) ([]*directoryEntry, error) { return parseDirEntries(b, de.filesystem) })
 		if err != nil {
-			return 0, 0, fmt.Errorf("could not read directory: %v", err)
-		}
-		if n != len(dirb) {
-			return 0, 0, fmt.Errorf("read %d bytes instead of expected %d", n, len(dirb))
-		}
-		// parse those entries
-		dirEntries, err := parseDirEntries(dirb, de.filesystem)
-		if err != nil {
-			return 0, 0, fmt.Errorf("could not parse directory: %v", err)
+			return 0, 0, err
 		}
 		// find the entry among the children that has the desired name
 		for _, entry := range dirEntries {

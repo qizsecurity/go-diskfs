@@ -38,6 +38,7 @@ type FileSystem struct {
 	jolietEnabled   bool
 	jolietPathTable *pathTable
 	jolietRootDir   *directoryEntry
+	dirs            directoryReader
 }
 
 // Equal compare if two filesystems are equal
@@ -443,7 +444,7 @@ func (fsm *FileSystem) ReadDir(p string) ([]iofs.DirEntry, error) {
 	} else {
 		dirEntries, err := fsm.readDirectory(p)
 		if err != nil {
-			return nil, fmt.Errorf("error reading directory %s: %v", p, err)
+			return nil, fmt.Errorf("error reading directory %s: %w", p, err)
 		}
 		for _, entry := range dirEntries {
 			// ignore any entry that is current directory or parent
@@ -668,7 +669,7 @@ func (fsm *FileSystem) readDirectoryPVD(p string) ([]*directoryEntry, error) {
 		//   it is slow, but this is how Unix does it, since many iso creators *do* create illegitimate disks
 		location, size, err = fsm.rootDir.getLocation(p)
 		if err != nil {
-			return nil, fmt.Errorf("unable to read directory tree for %s: %v", p, err)
+			return nil, fmt.Errorf("unable to read directory tree for %s: %w", p, err)
 		}
 	}
 
@@ -677,19 +678,10 @@ func (fsm *FileSystem) readDirectoryPVD(p string) ([]*directoryEntry, error) {
 		return nil, fmt.Errorf("could not find directory %s", p)
 	}
 
-	// we have a location, let's read the directories from it
-	b := make([]byte, size)
-	n, err = fsm.backend.ReadAt(b, int64(location)*fsm.blocksize)
+	// we have a location, let's read the directories from it, through a window, after the extent is checked against the volume
+	entries, err := fsm.readDirExtent("directory "+p, location, size, func(b []byte) ([]*directoryEntry, error) { return parseDirEntries(b, fsm) })
 	if err != nil {
-		return nil, fmt.Errorf("could not read directory entries for %s: %v", p, err)
-	}
-	if n != int(size) {
-		return nil, fmt.Errorf("reading directory %s returned %d bytes read instead of expected %d", p, n, size)
-	}
-	// parse the entries
-	entries, err := parseDirEntries(b, fsm)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse directory entries for %s: %v", p, err)
+		return nil, err
 	}
 	return entries, nil
 }
@@ -698,7 +690,6 @@ func (fsm *FileSystem) readDirectoryPVD(p string) ([]*directoryEntry, error) {
 func (fsm *FileSystem) readDirectoryJoliet(p string) ([]*directoryEntry, error) {
 	var (
 		location, size uint32
-		n              int
 	)
 
 	if fsm.jolietPathTable != nil {
@@ -723,17 +714,9 @@ func (fsm *FileSystem) readDirectoryJoliet(p string) ([]*directoryEntry, error) 
 		return nil, fmt.Errorf("could not find Joliet directory %s", p)
 	}
 
-	b := make([]byte, size)
-	n, err := fsm.backend.ReadAt(b, int64(location)*fsm.blocksize)
+	entries, err := fsm.readDirExtent("Joliet directory "+p, location, size, func(b []byte) ([]*directoryEntry, error) { return parseDirEntriesJoliet(b, fsm) })
 	if err != nil {
-		return nil, fmt.Errorf("could not read Joliet directory entries for %s: %v", p, err)
-	}
-	if n != int(size) {
-		return nil, fmt.Errorf("reading Joliet directory %s returned %d bytes read instead of expected %d", p, n, size)
-	}
-	entries, err := parseDirEntriesJoliet(b, fsm)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse Joliet directory entries for %s: %v", p, err)
+		return nil, err
 	}
 	return entries, nil
 }
